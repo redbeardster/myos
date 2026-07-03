@@ -2,7 +2,8 @@
 CC = gcc
 AS = nasm
 LD = ld
-CFLAGS = -m32 -ffreestanding -nostdlib -nostdinc -fno-builtin -fno-stack-protector -c
+
+CFLAGS = -m32 -ffreestanding -nostdlib -nostdinc -fno-builtin -fno-stack-protector -fno-pic -c
 LDFLAGS = -m elf_i386 -T linker.ld -nostdlib
 ASFLAGS = -f elf32
 
@@ -23,5 +24,5 @@ clean:
 run: myos.bin
 	qemu-system-i386 -kernel myos.bin
 
-# Для красивого запуска без Makefile:
-# qemu-system-i386 -kernel myos.bin
+debug: myos.bin
+	qemu-system-i386 -kernel myos.bin -s -S

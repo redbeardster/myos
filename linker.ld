@@ -3,27 +3,22 @@ ENTRY(start)
 
 SECTIONS
 {
-    . = 1M;           /* Ядро загружается по адресу 1 МБ */
+    . = 1M;
 
-    .text BLOCK(4K) : ALIGN(4K)
-    {
+    .text : {
         *(.multiboot)
         *(.text)
     }
 
-    .rodata BLOCK(4K) : ALIGN(4K)
-    {
-        *(.rodata)
-    }
-
-    .data BLOCK(4K) : ALIGN(4K)
-    {
+    .data : {
         *(.data)
     }
 
-    .bss BLOCK(4K) : ALIGN(4K)
-    {
-        *(COMMON)
+    .bss : {
         *(.bss)
+    }
+
+    .rodata : {
+        *(.rodata)
     }
 }

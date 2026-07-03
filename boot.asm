@@ -1,25 +1,23 @@
 ; boot.asm
-bits 32
 section .multiboot
-    ; Магическое число Multiboot
+    align 4
     dd 0x1BADB002
-    ; Флаги (0 = ничего особенного не нужно)
-    dd 0x0
-    ; Контрольная сумма (-магическое число - флаги)
-    dd -(0x1BADB002 + 0x0)
+    dd 0x00
+    dd -(0x1BADB002)
 
 section .text
 global start
-extern kmain          ; Функция из kernel.c
+extern kmain
 
 start:
-    cli               ; Отключаем прерывания
-    mov esp, stack_space ; Устанавливаем указатель стека
-    push eax          ; Сохраняем магическое число Multiboot (для совместимости)
-    push ebx          ; Сохраняем указатель на структуру Multiboot
-    call kmain        ; Вызываем главную функцию ядра
-    hlt               ; Останавливаем процессор (если kmain вернет управление)
+    mov esp, stack_top
+    push ebx
+    push eax
+    call kmain
+    cli
+    hlt
 
 section .bss
-    resb 8192         ; 8 КБ для стека
-stack_space:
+    align 16
+    resb 16384
+stack_top:
