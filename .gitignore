@@ -1,0 +1,9 @@
+*.o
+*.bin
+*.elf
+*.iso
+iso_root/
+myos.bin
+boot.o
+kernel.o
+limine/

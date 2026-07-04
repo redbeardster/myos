@@ -1,135 +1,242 @@
-// interrupt.c
 #include "interrupt.h"
-#include "terminal.h"
-#include "gdt.h"
-#include <stdint.h>
+#include "console.h"
+#include "io.h"
+#include "keyboard.h"
+#include "lwkt.h"
 
-// Структура дескриптора IDT
+#define PIC1_COMMAND 0x20
+#define PIC1_DATA    0x21
+#define PIC2_COMMAND 0xA0
+#define PIC2_DATA    0xA1
+#define PIC_EOI      0x20
+
+#define PIT_COMMAND  0x43
+#define PIT_CHANNEL0 0x40
+#define PIT_FREQUENCY 1193180
+#define TICK_FREQUENCY 100
+
+#define IRQ_TIMER 0
+#define IRQ_KEYBOARD 1
+
 struct idt_entry {
-    uint16_t base_low;
+    uint16_t offset_low;
     uint16_t selector;
-    uint8_t zero;
-    uint8_t flags;
-    uint16_t base_high;
+    uint8_t ist;
+    uint8_t type_attr;
+    uint16_t offset_mid;
+    uint32_t offset_high;
+    uint32_t zero;
 } __attribute__((packed));
 
-// Структура для загрузки IDT
 struct idt_ptr {
     uint16_t limit;
-    uint32_t base;
+    uint64_t base;
 } __attribute__((packed));
 
-// IDT с 256 записями
 static struct idt_entry idt[256];
-struct idt_ptr idtp;  // НЕ static - доступна из isr.asm
+struct idt_ptr idtp;
 
-// Внешние функции-обработчики (написаны в ассемблере)
-extern void isr0();
-extern void isr1();
-extern void isr2();
-extern void isr3();
-extern void isr4();
-extern void isr5();
-extern void isr6();
-extern void isr7();
-extern void isr8();
-extern void isr9();
-extern void isr10();
-extern void isr11();
-extern void isr12();
-extern void isr13();
-extern void isr14();
-extern void isr15();
-extern void isr16();
-extern void isr17();
-extern void isr18();
-extern void isr19();
-extern void isr20();
-extern void isr21();
-extern void isr22();
-extern void isr23();
-extern void isr24();
-extern void isr25();
-extern void isr26();
-extern void isr27();
-extern void isr28();
-extern void isr29();
-extern void isr30();
-extern void isr31();
+extern void isr0(void);
+extern void isr1(void);
+extern void isr2(void);
+extern void isr3(void);
+extern void isr4(void);
+extern void isr5(void);
+extern void isr6(void);
+extern void isr7(void);
+extern void isr8(void);
+extern void isr9(void);
+extern void isr10(void);
+extern void isr11(void);
+extern void isr12(void);
+extern void isr13(void);
+extern void isr14(void);
+extern void isr15(void);
+extern void isr16(void);
+extern void isr17(void);
+extern void isr18(void);
+extern void isr19(void);
+extern void isr20(void);
+extern void isr21(void);
+extern void isr22(void);
+extern void isr23(void);
+extern void isr24(void);
+extern void isr25(void);
+extern void isr26(void);
+extern void isr27(void);
+extern void isr28(void);
+extern void isr29(void);
+extern void isr30(void);
+extern void isr31(void);
+extern void isr32(void);
+extern void isr33(void);
+extern void isr34(void);
+extern void isr35(void);
+extern void isr36(void);
+extern void isr37(void);
+extern void isr38(void);
+extern void isr39(void);
+extern void isr40(void);
+extern void isr41(void);
+extern void isr42(void);
+extern void isr43(void);
+extern void isr44(void);
+extern void isr45(void);
+extern void isr46(void);
+extern void isr47(void);
 
-// Внешняя функция для загрузки IDT (из ассемблера)
-extern void idt_load();
+extern void isr128(void);
+extern void idt_load(uint64_t ptr);
 
-// Функция установки дескриптора IDT
-static void idt_set_gate(uint8_t num, uint32_t base, uint16_t selector, uint8_t flags) {
-    idt[num].base_low = base & 0xFFFF;
-    idt[num].base_high = (base >> 16) & 0xFFFF;
-    idt[num].selector = selector;
+static void (*isr_table[48])(void) = {
+    isr0, isr1, isr2, isr3, isr4, isr5, isr6, isr7,
+    isr8, isr9, isr10, isr11, isr12, isr13, isr14, isr15,
+    isr16, isr17, isr18, isr19, isr20, isr21, isr22, isr23,
+    isr24, isr25, isr26, isr27, isr28, isr29, isr30, isr31,
+    isr32, isr33, isr34, isr35, isr36, isr37, isr38, isr39,
+    isr40, isr41, isr42, isr43, isr44, isr45, isr46, isr47,
+};
+
+static volatile int timer_ticks;
+static volatile int timer_enabled;
+static volatile int timer_switch_count;
+
+static void idt_set_gate(uint8_t num, void (*handler)(void)) {
+    uint64_t addr = (uint64_t)handler;
+    idt[num].offset_low = (uint16_t)(addr & 0xFFFF);
+    idt[num].offset_mid = (uint16_t)((addr >> 16) & 0xFFFF);
+    idt[num].offset_high = (uint32_t)((addr >> 32) & 0xFFFFFFFF);
+    idt[num].selector = 0x08;
+    idt[num].ist = 0;
+    idt[num].type_attr = 0x8E;
     idt[num].zero = 0;
-    idt[num].flags = flags;
 }
 
-// Инициализация IDT
+static void idt_set_gate_user(uint8_t num, void (*handler)(void)) {
+    uint64_t addr = (uint64_t)handler;
+    idt[num].offset_low = (uint16_t)(addr & 0xFFFF);
+    idt[num].offset_mid = (uint16_t)((addr >> 16) & 0xFFFF);
+    idt[num].offset_high = (uint32_t)((addr >> 32) & 0xFFFFFFFF);
+    idt[num].selector = 0x08;
+    idt[num].ist = 0;
+    idt[num].type_attr = 0xEE;
+    idt[num].zero = 0;
+}
+
+void pic_init(void) {
+    outb(PIC1_COMMAND, 0x11);
+    outb(PIC1_DATA, 0x20);
+    outb(PIC1_DATA, 0x04);
+    outb(PIC1_DATA, 0x01);
+    outb(PIC1_DATA, 0x00);
+
+    outb(PIC2_COMMAND, 0x11);
+    outb(PIC2_DATA, 0x28);
+    outb(PIC2_DATA, 0x02);
+    outb(PIC2_DATA, 0x01);
+    outb(PIC2_DATA, 0x00);
+
+    outb(PIC1_DATA, 0xFC);
+    outb(PIC2_DATA, 0xFF);
+}
+
+void pic_eoi(uint8_t irq) {
+    if (irq >= 8) {
+        outb(PIC2_COMMAND, PIC_EOI);
+    }
+    outb(PIC1_COMMAND, PIC_EOI);
+}
+
 void idt_init(void) {
-    // Устанавливаем границу IDT
-    idtp.limit = (sizeof(struct idt_entry) * 256) - 1;
-    idtp.base = (uint32_t)&idt;
+    idtp.limit = (uint16_t)(sizeof(idt) - 1);
+    idtp.base = (uint64_t)&idt;
 
-    // Очищаем IDT
     for (int i = 0; i < 256; i++) {
-        idt_set_gate(i, 0, 0, 0);
+        idt_set_gate((uint8_t)i, isr0);
     }
 
-    // Устанавливаем обработчики для первых 32 прерываний (исключения)
-    idt_set_gate(0, (uint32_t)isr0, 0x08, 0x8E);
-    idt_set_gate(1, (uint32_t)isr1, 0x08, 0x8E);
-    idt_set_gate(2, (uint32_t)isr2, 0x08, 0x8E);
-    idt_set_gate(3, (uint32_t)isr3, 0x08, 0x8E);
-    idt_set_gate(4, (uint32_t)isr4, 0x08, 0x8E);
-    idt_set_gate(5, (uint32_t)isr5, 0x08, 0x8E);
-    idt_set_gate(6, (uint32_t)isr6, 0x08, 0x8E);
-    idt_set_gate(7, (uint32_t)isr7, 0x08, 0x8E);
-    idt_set_gate(8, (uint32_t)isr8, 0x08, 0x8E);
-    idt_set_gate(9, (uint32_t)isr9, 0x08, 0x8E);
-    idt_set_gate(10, (uint32_t)isr10, 0x08, 0x8E);
-    idt_set_gate(11, (uint32_t)isr11, 0x08, 0x8E);
-    idt_set_gate(12, (uint32_t)isr12, 0x08, 0x8E);
-    idt_set_gate(13, (uint32_t)isr13, 0x08, 0x8E);
-    idt_set_gate(14, (uint32_t)isr14, 0x08, 0x8E);
-    idt_set_gate(15, (uint32_t)isr15, 0x08, 0x8E);
-    idt_set_gate(16, (uint32_t)isr16, 0x08, 0x8E);
-    idt_set_gate(17, (uint32_t)isr17, 0x08, 0x8E);
-    idt_set_gate(18, (uint32_t)isr18, 0x08, 0x8E);
-    idt_set_gate(19, (uint32_t)isr19, 0x08, 0x8E);
-    idt_set_gate(20, (uint32_t)isr20, 0x08, 0x8E);
-    idt_set_gate(21, (uint32_t)isr21, 0x08, 0x8E);
-    idt_set_gate(22, (uint32_t)isr22, 0x08, 0x8E);
-    idt_set_gate(23, (uint32_t)isr23, 0x08, 0x8E);
-    idt_set_gate(24, (uint32_t)isr24, 0x08, 0x8E);
-    idt_set_gate(25, (uint32_t)isr25, 0x08, 0x8E);
-    idt_set_gate(26, (uint32_t)isr26, 0x08, 0x8E);
-    idt_set_gate(27, (uint32_t)isr27, 0x08, 0x8E);
-    idt_set_gate(28, (uint32_t)isr28, 0x08, 0x8E);
-    idt_set_gate(29, (uint32_t)isr29, 0x08, 0x8E);
-    idt_set_gate(30, (uint32_t)isr30, 0x08, 0x8E);
-    idt_set_gate(31, (uint32_t)isr31, 0x08, 0x8E);
+    for (int i = 0; i < 48; i++) {
+        idt_set_gate((uint8_t)i, isr_table[i]);
+    }
 
-    // Загружаем IDT
-    idt_load();
+    idt_set_gate_user(0x80, isr128);
+
+    idt_load((uint64_t)&idtp);
 }
 
-// Обработчик прерываний (вызывается из ассемблера)
-void interrupt_handler(uint32_t int_no, uint32_t err_code) {
-    terminal_writestring("Interrupt: ");
-    terminal_write_dec(int_no);
+void timer_init(void) {
+    uint32_t divisor = PIT_FREQUENCY / TICK_FREQUENCY;
+    outb(PIT_COMMAND, 0x36);
+    outb(PIT_CHANNEL0, (uint8_t)(divisor & 0xFF));
+    outb(PIT_CHANNEL0, (uint8_t)((divisor >> 8) & 0xFF));
+    timer_enabled = 1;
+}
 
-    if (err_code != 0) {
-        terminal_writestring(", Error code: ");
-        terminal_write_hex(err_code);
+int timer_get_ticks(void) {
+    return timer_ticks;
+}
+
+int timer_is_enabled(void) {
+    return timer_enabled;
+}
+
+void timer_set_enabled(int enabled) {
+    timer_enabled = enabled;
+}
+
+void timer_interrupt_handler(void) {
+    timer_ticks++;
+    if (timer_enabled && (timer_ticks % 3) == 0) {
+        timer_switch_count++;
+        lwkt_preempt_request();
+    }
+}
+
+int timer_get_switch_count(void) {
+    return timer_switch_count;
+}
+
+void timer_reset_stats(void) {
+    timer_ticks = 0;
+    timer_switch_count = 0;
+}
+
+void interrupts_enable(void) {
+    __asm__ volatile("sti");
+}
+
+void interrupt_handler(uint64_t int_no, uint64_t err_code) {
+    (void)err_code;
+
+    if (int_no >= 32 && int_no < 48) {
+        uint8_t irq = (uint8_t)(int_no - 32);
+
+        if (irq == IRQ_TIMER) {
+            timer_interrupt_handler();
+        } else if (irq == IRQ_KEYBOARD) {
+            keyboard_irq_handler();
+        }
+
+        pic_eoi(irq);
+        if (irq == IRQ_TIMER) {
+            lwkt_preempt_request();
+        }
+        return;
     }
 
-    terminal_writestring("\n");
+    if (int_no < 32) {
+        uint64_t cr2;
+        __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
 
-    // Бесконечный цикл при ошибке
-    while(1) {}
+        console_writestring("\nCPU exception ");
+        console_write_dec(int_no);
+        console_writestring(" err=");
+        console_write_hex(err_code);
+        console_writestring(" cr2=");
+        console_write_hex(cr2);
+        console_writestring("\n");
+        for (;;) {
+            __asm__ volatile("hlt");
+        }
+    }
 }

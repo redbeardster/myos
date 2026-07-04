@@ -1,48 +1,71 @@
-; isr.asm - Обработчики прерываний
-bits 32
+bits 64
 
 section .text
+
+extern interrupt_handler
+extern lwkt_thread_exit
+
 global isr0, isr1, isr2, isr3, isr4, isr5, isr6, isr7
 global isr8, isr9, isr10, isr11, isr12, isr13, isr14, isr15
 global isr16, isr17, isr18, isr19, isr20, isr21, isr22, isr23
 global isr24, isr25, isr26, isr27, isr28, isr29, isr30, isr31
-global idt_load, gdt_load
+global isr32, isr33, isr34, isr35, isr36, isr37, isr38, isr39
+global isr40, isr41, isr42, isr43, isr44, isr45, isr46, isr47
+global gdt_load, idt_load, switch_context, thread_bootstrap
+global isr128, user_enter_asm, load_tss
 
-; Внешняя функция C
-extern interrupt_handler
-
-; Внешние переменные из C
-extern idtp
-
-; Макрос для создания обработчиков без кода ошибки
 %macro ISR_NOERR 1
-  isr%1:
-    push 0          ; Фиктивный код ошибки
-    push %1         ; Номер прерывания
+isr%1:
+    push qword 0
+    push %1
     jmp isr_common
 %endmacro
 
-; Макрос для создания обработчиков с кодом ошибки
 %macro ISR_ERR 1
-  isr%1:
-    push %1         ; Номер прерывания
+isr%1:
+    push %1
     jmp isr_common
 %endmacro
 
-; Общий обработчик
 isr_common:
-    pusha           ; Сохраняем все регистры
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
 
-    ; Вызываем C-обработчик
-    push esp        ; Указатель на стек
+    mov rdi, [rsp + 15 * 8]
+    mov rsi, [rsp + 15 * 8 + 8]
     call interrupt_handler
-    add esp, 4
 
-    popa            ; Восстанавливаем регистры
-    add esp, 8      ; Убираем номер прерывания и код ошибки
-    iret            ; Возврат из прерывания
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    add rsp, 16
+    iretq
 
-; Создаём обработчики для всех 32 прерываний
 ISR_NOERR 0
 ISR_NOERR 1
 ISR_NOERR 2
@@ -75,33 +98,135 @@ ISR_NOERR 28
 ISR_NOERR 29
 ISR_NOERR 30
 ISR_NOERR 31
+ISR_NOERR 32
+ISR_NOERR 33
+ISR_NOERR 34
+ISR_NOERR 35
+ISR_NOERR 36
+ISR_NOERR 37
+ISR_NOERR 38
+ISR_NOERR 39
+ISR_NOERR 40
+ISR_NOERR 41
+ISR_NOERR 42
+ISR_NOERR 43
+ISR_NOERR 44
+ISR_NOERR 45
+ISR_NOERR 46
+ISR_NOERR 47
 
-; Загрузка IDT
-idt_load:
-    lidt [idtp]
+; int 0x80 syscall vector
+isr128:
+    push qword 0
+    push 128
+    jmp syscall_common
+
+syscall_common:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+
+    mov rdi, [rsp + 14 * 8]     ; syscall number (rax)
+    mov rsi, [rsp + 9 * 8]      ; arg1 (rdi)
+    mov rdx, [rsp + 10 * 8]     ; arg2 (rsi)
+    mov rcx, [rsp + 11 * 8]     ; arg3 (rdx)
+    call syscall_dispatch
+    mov [rsp + 14 * 8], rax
+
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    add rsp, 16
+    iretq
+
+extern syscall_dispatch
+
+global user_enter_asm
+
+user_enter_asm:
+    ; rdi = rip, rsi = rsp, rdx = &saved_kernel_rsp
+    mov [rdx], rsp
+    push qword 0x23
+    push rsi
+    pushfq
+    pop rax
+    or rax, 0x202
+    push rax
+    push qword 0x1B
+    push rdi
+    iretq
+
+global load_tss
+load_tss:
+    ltr di
     ret
 
-; Загрузка GDT (принимает указатель на gdt_ptr в стеке - стандартный вызов C)
+global gdt_load
 gdt_load:
-    ; Получаем аргумент (указатель на gdt_ptr) из стека
-    mov eax, [esp + 4]   ; Первый аргумент функции
-    mov [gdt_ptr_temp], eax  ; Сохраняем указатель
-
-    ; Загружаем GDT
-    lgdt [gdt_ptr_temp]
-
-    ; Перезагружаем сегменты
-    jmp 0x08:.gdt_reload
-.gdt_reload:
-    mov ax, 0x10    ; Сегмент данных ядра
+    lgdt [rdi]
+    mov ax, 0x10
     mov ds, ax
     mov es, ax
+    mov ss, ax
     mov fs, ax
     mov gs, ax
-    mov ss, ax
+    pop rax             ; return address (RIP)
+    push qword 0x08     ; new CS selector (64-bit kernel code)
+    push rax            ; RIP
+    retfq               ; far return -> reloads CS from our GDT
+
+global idt_load
+idt_load:
+    lidt [rdi]
     ret
 
-section .data
-gdt_ptr_temp:
-    dw 0
-    dd 0
+global switch_context
+switch_context:
+    ; rdi = &old->rsp, rsi = new rsp
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+    mov [rdi], rsp
+    mov rsp, rsi
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    ret
+
+
+global thread_bootstrap
+thread_bootstrap:
+    pop rdi
+    pop rax
+    call rax
+    jmp lwkt_thread_exit

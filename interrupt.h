@@ -1,16 +1,20 @@
-// interrupt.h
 #ifndef INTERRUPT_H
 #define INTERRUPT_H
 
 #include <stdint.h>
 
-// Инициализация IDT
 void idt_init(void);
+void pic_init(void);
+void pic_eoi(uint8_t irq);
+void interrupts_enable(void);
+void interrupt_handler(uint64_t int_no, uint64_t err_code);
 
-// Обработчик прерываний (общий)
-void interrupt_handler(uint32_t int_no, uint32_t err_code);
-
-// Установка обработчика для конкретного прерывания
-void set_interrupt_handler(uint8_t num, void* handler);
+void timer_init(void);
+void timer_interrupt_handler(void);
+int timer_get_ticks(void);
+int timer_get_switch_count(void);
+void timer_reset_stats(void);
+int timer_is_enabled(void);
+void timer_set_enabled(int enabled);
 
 #endif
