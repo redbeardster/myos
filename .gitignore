@@ -7,3 +7,4 @@ myos.bin
 boot.o
 kernel.o
 limine/
+DragonFlyBSD
