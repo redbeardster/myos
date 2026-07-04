@@ -2,7 +2,7 @@
 #define MYOS_H
 
 #include <stdint.h>
-#include "../myos_abi.h"
+#include "myos_abi.h"
 
 typedef long myos_ssize_t;
 

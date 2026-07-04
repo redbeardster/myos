@@ -31,7 +31,28 @@
 └─────────────────────────────────────────────────────────────┘
 ```
 
-**Загрузка:** Limine → `kernel.c` → `exec_start_shell()` → `lwkt_bootstrap_first()`.
+**Загрузка:** Limine → `kernel/main.c` → `exec_start_shell()` → `lwkt_bootstrap_first()`.
+
+### Структура каталогов
+
+```
+os/
+├── Makefile              # сборка → build/myos.iso
+├── limine.conf
+├── include/              # заголовки ядра и ABI (myos_abi.h, limine.h, …)
+├── kernel/
+│   ├── main.c            # kmain
+│   ├── arch/x86_64/      # GDT, IDT, ISR, linker.ld
+│   ├── drivers/          # framebuffer console, keyboard
+│   ├── mm/               # physical memory, VMM
+│   ├── sched/            # LWKT, uthread, msgport
+│   ├── proc/             # proc, exec, ELF loader
+│   └── syscall/          # syscall dispatch, user helpers
+├── user/                 # shell.elf, hello.elf, crt0
+├── docs/                 # документация для разработки
+├── tools/                # вспомогательные скрипты (QEMU monitor)
+└── build/                # артефакты сборки (в .gitignore)
+```
 
 **Модель процессов:** у каждого `proc` свой CR3; виртуальная карта одинакова у всех
 (`0x400000` text, `0x500000+` heap, `0x700000` stack), физические страницы изолированы.
@@ -42,7 +63,7 @@
 
 ### Userland → ядро
 
-- Только **системные вызовы** (`int 0x80`), номера и layout — в `myos_abi.h` / `user/myos.h`.
+- Только **системные вызовы** (`int 0x80`), номера и layout — в `include/myos_abi.h` / `user/myos.h`.
 - Userland **не** обращается к msgport, LWKT и внутренним структурам ядра напрямую.
 - Все указатели из userland копируются через `copy_from_user` / `copy_user_string` в `syscall.c`.
 
@@ -172,8 +193,8 @@ user: SYS_EXIT
 
 ## 7. Добавление нового syscall
 
-1. Константа в `myos_abi.h` и обёртка в `user/myos.h`.
-2. Ветка в `syscall_dispatch()` в `syscall.c`.
+1. Константа в `include/myos_abi.h` и обёртка в `user/myos.h`.
+2. Ветка в `syscall_dispatch()` в `kernel/syscall/syscall.c`.
 3. Копирование аргументов из userland в kernel buffer (`copy_from_user`).
 4. Выбор модели завершения: быстрый return / block / exit (таблица выше).
 5. Если syscall глубокий (много локальных переменных, циклы, I/O) — учитывать размер
@@ -184,8 +205,8 @@ user: SYS_EXIT
 ## 8. Добавление нового userland-бинарника
 
 1. Исходник в `user/`, linker script `user/linker.ld` (база `0x400000`).
-2. Цель в `user/Makefile`, embed в ядро (`hello_embed.o` / `shell_embed.o`) или модуль Limine.
-3. Регистрация в `exec_spawn_module()` (`exec.c`) по суффиксу имени.
+2. Цель в `user/Makefile`, embed в ядро (`build/*_embed.o`) или модуль Limine.
+3. Регистрация в `exec_spawn_module()` (`kernel/proc/exec.c`) по суффиксу имени.
 4. Запуск из shell: `exec name.elf` → `SYS_EXEC`.
 
 Проверки после добавления — см. раздел 10.
@@ -196,16 +217,17 @@ user: SYS_EXIT
 
 | Файл | Назначение |
 |------|------------|
-| `myos_abi.h` | VA layout, номера syscall |
-| `isr.asm` | `int 0x80`, `user_enter_asm`, `switch_context` |
-| `syscall.c` | Dispatch и copy_from_user |
-| `lwkt.c` | Планировщик, CR3, TSS, deferred CR3 destroy |
-| `uthread.c` | User/kernel uthread, trampoline |
-| `proc.c` | Таблица процессов, destroy, kill |
-| `vmm.c` | Aspace, map/unmap, active CR3 checks |
-| `exec.c` / `elf.c` | Загрузка ELF в aspace процесса |
-| `user.c` | `user_enter`, heap в aspace текущего proc |
-| `gdt.c` | GDT, TSS, `tss_set_rsp0()` |
+| `include/myos_abi.h` | VA layout, номера syscall |
+| `kernel/arch/x86_64/isr.asm` | `int 0x80`, `user_enter_asm`, `switch_context` |
+| `kernel/syscall/syscall.c` | Dispatch и copy_from_user |
+| `kernel/sched/lwkt.c` | Планировщик, CR3, TSS, deferred CR3 destroy |
+| `kernel/sched/uthread.c` | User/kernel uthread, trampoline |
+| `kernel/proc/proc.c` | Таблица процессов, destroy, kill |
+| `kernel/mm/vmm.c` | Aspace, map/unmap, active CR3 checks |
+| `kernel/proc/exec.c` / `kernel/proc/elf.c` | Загрузка ELF в aspace процесса |
+| `kernel/syscall/user.c` | `user_enter`, heap в aspace текущего proc |
+| `kernel/arch/x86_64/gdt.c` | GDT, TSS, `tss_set_rsp0()` |
+| `kernel/main.c` | Точка входа `kmain` |
 
 ---
 

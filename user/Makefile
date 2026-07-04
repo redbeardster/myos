@@ -4,8 +4,9 @@ CC = gcc
 AS = nasm
 LD = ld
 
+INC = -I. -I../include
 CFLAGS = -m64 -ffreestanding -nostdlib -fno-builtin -fno-stack-protector \
-         -fno-pic -fno-pie -mno-red-zone -Wall -Wextra -std=gnu11 -I.
+         -fno-pic -fno-pie -mno-red-zone -Wall -Wextra -std=gnu11 $(INC)
 ASFLAGS = -f elf64
 LDFLAGS = -m elf_x86_64 -nostdlib -static -z max-page-size=0x1000
 
@@ -24,10 +25,10 @@ hello.elf: $(CRT) hello.o linker.ld
 crt0.o: crt0.asm
 	$(AS) $(ASFLAGS) crt0.asm -o crt0.o
 
-shell.o: shell.c myos.h ../myos_abi.h
+shell.o: shell.c myos.h
 	$(CC) $(CFLAGS) -c shell.c -o shell.o
 
-hello.o: hello.c myos.h ../myos_abi.h
+hello.o: hello.c myos.h
 	$(CC) $(CFLAGS) -c hello.c -o hello.o
 
 clean:

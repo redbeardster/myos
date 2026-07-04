@@ -1,10 +1,11 @@
+build/
 *.o
 *.bin
 *.elf
 *.iso
+*.sock
+*.png
+*.ppm
 iso_root/
-myos.bin
-boot.o
-kernel.o
 limine/
-DragonFlyBSD
+DragonFlyBSD/
