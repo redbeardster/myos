@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 void idt_init(void);
+void idt_reload(void);
 void pic_init(void);
 void pic_eoi(uint8_t irq);
 void interrupts_enable(void);

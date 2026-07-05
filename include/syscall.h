@@ -15,6 +15,14 @@
 #define SYS_EXEC     MYOS_SYS_EXEC
 #define SYS_PS       MYOS_SYS_PS
 #define SYS_THREADS  MYOS_SYS_THREADS
+#define SYS_UTHREADS MYOS_SYS_UTHREADS
+#define SYS_MSGD_ID  MYOS_SYS_MSGD_ID
+#define SYS_MSG_PING MYOS_SYS_MSG_PING
+#define SYS_THREAD_CREATE MYOS_SYS_THREAD_CREATE
+#define SYS_THREAD_JOIN MYOS_SYS_THREAD_JOIN
+#define SYS_MUTEX_LOCK MYOS_SYS_MUTEX_LOCK
+#define SYS_MUTEX_UNLOCK MYOS_SYS_MUTEX_UNLOCK
+#define SYS_CPUS       MYOS_SYS_CPUS
 
 void syscall_init(void);
 uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3);

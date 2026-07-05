@@ -48,8 +48,8 @@ os/
 │   ├── sched/            # LWKT, uthread, msgport
 │   ├── proc/             # proc, exec, ELF loader
 │   └── syscall/          # syscall dispatch, user helpers
-├── user/                 # shell.elf, hello.elf, crt0
-├── docs/                 # документация для разработки
+├── user/                 # shell.elf, hello.elf, crt0, programs.mk
+├── docs/                 # DEVELOPMENT.md, USERLAND.md
 ├── tools/                # вспомогательные скрипты (QEMU monitor)
 └── build/                # артефакты сборки (в .gitignore)
 ```
@@ -171,6 +171,27 @@ user: SYS_EXIT
 - После exit LWKT-слот: `id = 0`, `msgport_clear_slot()` в `lwkt_thread_exit()`.
 - Shell (`EXEC_FLAG_SHELL`, `proc->is_shell`) не убивается через `proc_kill_children()`.
 
+### Многопоточность userland (uthread)
+
+- Один proc — несколько uthread; у каждого свой user stack (`user_stack_alloc`).
+- `SYS_THREAD_CREATE` / `JOIN` / mutex — см. [THREADS_DEMO.md](THREADS_DEMO.md).
+- **Планировщик uthread нет** — каждый uthread привязан к LWKT; вытеснение = вытеснение LWKT.
+
+### Вытесняющая многозадачность (LWKT)
+
+| Источник | Файл | Поведение |
+|----------|------|-----------|
+| PIT IRQ ~100 Hz | `interrupt.c` | `lwkt_preempt_request()` → `lwkt_preempt_check()` после EOI |
+| Выход из syscall | `syscall.c` | `lwkt_preempt_check()` в конце `syscall_dispatch` |
+| `SYS_YIELD` | `lwkt.c` | немедленный `lwkt_switch()` (кооперативно) |
+| `lwkt_block` | `lwkt.c` | блокировка (mutex, join, read, msg) |
+
+Ограничения unicore:
+
+- Preempt только в точках вызова `lwkt_preempt_check` (не произвольная инструкция внутри длинного syscall handler).
+- 16 уровней приоритета; нет fair time slice per thread.
+- SMP: потребуются per-CPU run queue, IPI, spinlock везде (частично готово — `spinlock.h`, `proc_mutex.c`, `memory.c`).
+
 ---
 
 ## 6. Правила для syscall-обработчиков
@@ -204,12 +225,18 @@ user: SYS_EXIT
 
 ## 8. Добавление нового userland-бинарника
 
-1. Исходник в `user/`, linker script `user/linker.ld` (база `0x400000`).
-2. Цель в `user/Makefile`, embed в ядро (`build/*_embed.o`) или модуль Limine.
-3. Регистрация в `exec_spawn_module()` (`kernel/proc/exec.c`) по суффиксу имени.
-4. Запуск из shell: `exec name.elf` → `SYS_EXEC`.
+**Полное руководство:** [USERLAND.md](USERLAND.md)
 
-Проверки после добавления — см. раздел 10.
+Кратко:
+
+1. `cp user/template.c user/foo.c`, отредактировать.
+2. Добавить `foo` в `PROGRAMS` в `user/programs.mk`.
+3. `make && make run` → в shell: `exec foo.elf`.
+
+Регистрация в ядре (`exec`, embed, ISO, `limine.conf`) выполняется **автоматически**
+через `tools/gen_user_embeds.sh` и `tools/gen_limine_conf.sh`.
+
+Проверки после добавления — см. раздел 10 и чеклист в USERLAND.md.
 
 ---
 
@@ -220,7 +247,7 @@ user: SYS_EXIT
 | `include/myos_abi.h` | VA layout, номера syscall |
 | `kernel/arch/x86_64/isr.asm` | `int 0x80`, `user_enter_asm`, `switch_context` |
 | `kernel/syscall/syscall.c` | Dispatch и copy_from_user |
-| `kernel/sched/lwkt.c` | Планировщик, CR3, TSS, deferred CR3 destroy |
+| `kernel/sched/lwkt.c` | Планировщик, CR3, TSS, deferred CR3 destroy, **preempt** |
 | `kernel/sched/uthread.c` | User/kernel uthread, trampoline |
 | `kernel/proc/proc.c` | Таблица процессов, destroy, kill |
 | `kernel/mm/vmm.c` | Aspace, map/unmap, active CR3 checks |
@@ -280,7 +307,8 @@ if (t && t->uthread && t->uthread->type == UTHREAD_USER) {
 - Новые блокирующие syscall — по образцу `SYS_READ` (`lwkt_block` на syscall stack).
 - Любое копирование из user VA — с активным CR3 **того процесса**, который вызвал syscall
   (`proc_current()->cr3` уже выбран через `lwkt_apply_cr3`).
-- Для SMP в будущем: TSS и CR3 per-CPU / per-thread, те же инварианты на каждом ядре.
+- Для SMP: см. [SMP.md](SMP.md) — AP boot, per-CPU TSS/GS, LAPIC timer, `sched_lock`.
+- Mutex proc: `proc_mutex.c`, до `MYOS_PROC_MUTEX_MAX` слотов, wait queue через `lwkt_thread.wait_next`.
 
 ---
 

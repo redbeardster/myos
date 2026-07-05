@@ -81,7 +81,11 @@ static void cmd_help(void) {
     write_str("  echo <text>     - print text\n");
     write_str("  exec [name]     - run ELF (default hello.elf)\n");
     write_str("  ps              - list processes (CR3, uthreads)\n");
+    write_str("  uthreads        - list uthreads (slot, proc, lwkt)\n");
+    write_str("  cpus            - SMP CPU status (per-CPU scheduler)\n");
     write_str("  threads         - list LWKT scheduler threads\n");
+    write_str("  msg <text>      - send message to msgd kernel thread\n");
+    write_str("  ping            - msgport ping/pong with msgd\n");
     write_str("  yield           - syscall yield test\n");
 }
 
@@ -112,6 +116,49 @@ static void run_command(char *line) {
 
     if (str_eq(line, "threads")) {
         myos_threads();
+        return;
+    }
+
+    if (str_eq(line, "uthreads")) {
+        myos_uthreads();
+        return;
+    }
+
+    if (str_eq(line, "cpus")) {
+        myos_cpus();
+        return;
+    }
+
+    if (str_eq(line, "ping")) {
+        long rc = myos_msg_ping();
+        if (rc < 0) {
+            write_str("\nping failed\n");
+        }
+        return;
+    }
+
+    if (str_starts(line, "msg ")) {
+        long msgd = myos_msgd_id();
+        if (msgd < 0) {
+            write_str("\nmsgd not available\n");
+            return;
+        }
+        const char *text = line + 4;
+        while (*text == ' ') {
+            text++;
+        }
+        if (*text == '\0') {
+            write_str("\nusage: msg <text>\n");
+            return;
+        }
+        unsigned long len = str_len(text);
+        if (len > 60) {
+            len = 60;
+        }
+        long rc = myos_msg_send(msgd, text, len);
+        if (rc < 0) {
+            write_str("\nmsg send failed\n");
+        }
         return;
     }
 

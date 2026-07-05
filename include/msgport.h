@@ -40,5 +40,9 @@ int msgport_wakeup(struct lwkt_thread *t);
 
 void msg_echo_worker(void *arg);
 void msg_ping_worker(void *arg);
+void msgd_worker(void *arg);
+
+int msgd_start(void);
+uint32_t msgd_thread_id(void);
 
 #endif

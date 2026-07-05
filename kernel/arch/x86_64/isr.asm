@@ -10,7 +10,7 @@ global isr8, isr9, isr10, isr11, isr12, isr13, isr14, isr15
 global isr16, isr17, isr18, isr19, isr20, isr21, isr22, isr23
 global isr24, isr25, isr26, isr27, isr28, isr29, isr30, isr31
 global isr32, isr33, isr34, isr35, isr36, isr37, isr38, isr39
-global isr40, isr41, isr42, isr43, isr44, isr45, isr46, isr47
+global isr40, isr41, isr42, isr43, isr44, isr45, isr46, isr47, isr64, isr65
 global gdt_load, idt_load, switch_context, thread_bootstrap
 global isr128, user_enter_asm, load_tss
 
@@ -114,6 +114,8 @@ ISR_NOERR 44
 ISR_NOERR 45
 ISR_NOERR 46
 ISR_NOERR 47
+ISR_NOERR 64
+ISR_NOERR 65
 
 ; int 0x80 syscall vector
 isr128:
@@ -168,8 +170,10 @@ extern syscall_dispatch
 global user_enter_asm
 
 user_enter_asm:
-    ; rdi = rip, rsi = rsp, rdx = &saved_kernel_rsp
-    mov [rdx], rsp
+    ; rdi = rip, rsi = rsp, rdx = arg, rcx = &saved_kernel_rsp
+    mov [rcx], rsp
+    mov r8, rdi
+    mov rdi, rdx
     push qword 0x23
     push rsi
     pushfq
@@ -177,7 +181,7 @@ user_enter_asm:
     or rax, 0x202
     push rax
     push qword 0x1B
-    push rdi
+    push r8
     iretq
 
 global load_tss

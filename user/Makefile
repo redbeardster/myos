@@ -1,5 +1,7 @@
 # MyOS userland (MyOS ABI, not Linux)
 
+include programs.mk
+
 CC = gcc
 AS = nasm
 LD = ld
@@ -11,25 +13,22 @@ ASFLAGS = -f elf64
 LDFLAGS = -m elf_x86_64 -nostdlib -static -z max-page-size=0x1000
 
 CRT = crt0.o
+ELFS = $(PROGRAMS:=.elf)
 
 .PHONY: all clean
 
-all: shell.elf hello.elf
+all: $(ELFS)
 
-shell.elf: $(CRT) shell.o linker.ld
-	$(LD) $(LDFLAGS) -T linker.ld $(CRT) shell.o -o shell.elf
-
-hello.elf: $(CRT) hello.o linker.ld
-	$(LD) $(LDFLAGS) -T linker.ld $(CRT) hello.o -o hello.elf
+%.elf: %.o $(CRT) linker.ld
+	$(LD) $(LDFLAGS) -T linker.ld $(CRT) $< -o $@
 
 crt0.o: crt0.asm
 	$(AS) $(ASFLAGS) crt0.asm -o crt0.o
 
-shell.o: shell.c myos.h
-	$(CC) $(CFLAGS) -c shell.c -o shell.o
+%.o: %.c myos.h
+	$(CC) $(CFLAGS) -c $< -o $@
 
-hello.o: hello.c myos.h
-	$(CC) $(CFLAGS) -c hello.c -o hello.o
+.PRECIOUS: %.o
 
 clean:
-	rm -f *.o shell.elf hello.elf
+	rm -f *.o $(ELFS)

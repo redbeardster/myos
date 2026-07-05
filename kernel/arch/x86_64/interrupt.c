@@ -1,7 +1,9 @@
 #include "interrupt.h"
 #include "console.h"
+#include "cpu.h"
 #include "io.h"
 #include "keyboard.h"
+#include "lapic.h"
 #include "lwkt.h"
 
 #define PIC1_COMMAND 0x20
@@ -84,6 +86,8 @@ extern void isr44(void);
 extern void isr45(void);
 extern void isr46(void);
 extern void isr47(void);
+extern void isr64(void);
+extern void isr65(void);
 
 extern void isr128(void);
 extern void idt_load(uint64_t ptr);
@@ -159,8 +163,15 @@ void idt_init(void) {
         idt_set_gate((uint8_t)i, isr_table[i]);
     }
 
+    idt_set_gate(LAPIC_TIMER_VECTOR, isr64);
+    idt_set_gate(LAPIC_IPI_RESCHED_VECTOR, isr65);
+
     idt_set_gate_user(0x80, isr128);
 
+    idt_load((uint64_t)&idtp);
+}
+
+void idt_reload(void) {
     idt_load((uint64_t)&idtp);
 }
 
@@ -186,10 +197,8 @@ void timer_set_enabled(int enabled) {
 
 void timer_interrupt_handler(void) {
     timer_ticks++;
-    if (timer_enabled && (timer_ticks % 3) == 0) {
-        timer_switch_count++;
-        lwkt_preempt_request();
-    }
+    timer_switch_count++;
+    lwkt_preempt_request();
 }
 
 int timer_get_switch_count(void) {
@@ -208,6 +217,22 @@ void interrupts_enable(void) {
 void interrupt_handler(uint64_t int_no, uint64_t err_code) {
     (void)err_code;
 
+    if (int_no == LAPIC_TIMER_VECTOR) {
+        timer_ticks++;
+        timer_switch_count++;
+        lwkt_preempt_request();
+        lapic_eoi();
+        lwkt_preempt_check();
+        return;
+    }
+
+    if (int_no == LAPIC_IPI_RESCHED_VECTOR) {
+        lwkt_preempt_request();
+        lapic_eoi();
+        lwkt_preempt_check();
+        return;
+    }
+
     if (int_no >= 32 && int_no < 48) {
         uint8_t irq = (uint8_t)(int_no - 32);
 
@@ -219,7 +244,7 @@ void interrupt_handler(uint64_t int_no, uint64_t err_code) {
 
         pic_eoi(irq);
         if (irq == IRQ_TIMER) {
-            lwkt_preempt_request();
+            lwkt_preempt_check();
         }
         return;
     }

@@ -1,4 +1,5 @@
 build/
+limine.conf
 *.o
 *.bin
 *.elf

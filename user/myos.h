@@ -52,4 +52,40 @@ static inline long myos_threads(void) {
     return myos_syscall4(MYOS_SYS_THREADS, 0, 0, 0, 0);
 }
 
+static inline long myos_uthreads(void) {
+    return myos_syscall4(MYOS_SYS_UTHREADS, 0, 0, 0, 0);
+}
+
+static inline long myos_msgd_id(void) {
+    return myos_syscall4(MYOS_SYS_MSGD_ID, 0, 0, 0, 0);
+}
+
+static inline long myos_msg_send(long to_id, const void *buf, unsigned long len) {
+    return myos_syscall4(MYOS_SYS_MSG_SEND, to_id, (long)(uintptr_t)buf, (long)len, 0);
+}
+
+static inline long myos_msg_ping(void) {
+    return myos_syscall4(MYOS_SYS_MSG_PING, 0, 0, 0, 0);
+}
+
+static inline long myos_thread_create(uintptr_t entry, uint64_t arg, long prio) {
+    return myos_syscall4(MYOS_SYS_THREAD_CREATE, (long)entry, (long)arg, prio, 0);
+}
+
+static inline long myos_thread_join(long lwkt_id) {
+    return myos_syscall4(MYOS_SYS_THREAD_JOIN, lwkt_id, 0, 0, 0);
+}
+
+static inline long myos_mutex_lock(unsigned long id) {
+    return myos_syscall4(MYOS_SYS_MUTEX_LOCK, (long)id, 0, 0, 0);
+}
+
+static inline long myos_mutex_unlock(unsigned long id) {
+    return myos_syscall4(MYOS_SYS_MUTEX_UNLOCK, (long)id, 0, 0, 0);
+}
+
+static inline long myos_cpus(void) {
+    return myos_syscall4(MYOS_SYS_CPUS, 0, 0, 0, 0);
+}
+
 #endif

@@ -1,8 +1,13 @@
 #include "lwkt.h"
+
 #include "console.h"
+#include "cpu.h"
 #include "gdt.h"
 #include "interrupt.h"
+#include "lapic.h"
 #include "msgport.h"
+#include "proc.h"
+#include "spinlock.h"
 #include "uthread.h"
 #include "vmm.h"
 
@@ -14,11 +19,9 @@ extern void thread_bootstrap(void);
 
 static struct lwkt_thread thread_pool[MAX_THREADS];
 static struct lwkt_thread *run_queues[MAX_PRIORITY];
-static struct lwkt_thread *current_thread;
-static struct lwkt_thread idle_thread;
+static spinlock_t sched_lock;
 static int thread_count;
 static uint32_t next_id = 1;
-static volatile int preempt_requested;
 static int sched_active;
 
 static void strcpy_local(char *dst, const char *src) {
@@ -26,6 +29,10 @@ static void strcpy_local(char *dst, const char *src) {
         *dst++ = *src++;
     }
     *dst = '\0';
+}
+
+static struct cpu *this_cpu(void) {
+    return cpu_current();
 }
 
 static void enqueue_thread(struct lwkt_thread *t) {
@@ -63,7 +70,7 @@ static int remove_from_queues(struct lwkt_thread *t) {
     return 0;
 }
 
-static struct lwkt_thread *dequeue_thread(struct lwkt_thread *skip) {
+static struct lwkt_thread *dequeue_thread(struct cpu *cpu, struct lwkt_thread *skip) {
     struct lwkt_thread *fallback = NULL;
 
     for (uint32_t p = 0; p < MAX_PRIORITY; p++) {
@@ -93,7 +100,7 @@ static struct lwkt_thread *dequeue_thread(struct lwkt_thread *skip) {
         return fallback;
     }
 
-    return &idle_thread;
+    return &cpu->idle;
 }
 
 static void init_thread_stack(struct lwkt_thread *t) {
@@ -132,6 +139,52 @@ static const char *state_name(enum thread_state state) {
     }
 }
 
+static void print_uthread_cols(struct lwkt_thread *t) {
+    struct uthread *u = t ? t->uthread : NULL;
+    if (!u) {
+        console_writestring("  -   -  ");
+        return;
+    }
+    console_writestring("  ");
+    console_write_dec(uthread_slot_of(u));
+    console_writestring("   ");
+    int pin = uthread_index_in_proc(u);
+    if (pin > 0) {
+        console_write_dec((uint64_t)pin);
+    } else {
+        console_putchar('-');
+    }
+    console_writestring("  ");
+}
+
+static void print_thread_row(struct lwkt_thread *t, int is_current) {
+    int cpu_idx = cpu_index_of_thread(t);
+    console_write_dec(t->id);
+    print_uthread_cols(t);
+    console_writestring(t->name);
+    console_writestring("  ");
+    console_write_dec(t->priority);
+    console_writestring("     ");
+    console_writestring(state_name(t->state));
+    if (is_current) {
+        console_writestring(" *  ");
+    } else {
+        console_writestring("    ");
+    }
+    if (cpu_idx >= 0) {
+        console_write_dec((uint64_t)cpu_idx);
+    } else {
+        console_putchar('-');
+    }
+    console_writestring("  ");
+    if (t->user_cr3) {
+        console_write_hex(t->user_cr3);
+    } else {
+        console_writestring("-");
+    }
+    console_putchar('\n');
+}
+
 static void worker_entry(void *arg) {
     (void)arg;
     struct lwkt_thread *self = lwkt_curthread();
@@ -167,7 +220,39 @@ void lwkt_default_worker(void *arg) {
     worker_entry(arg);
 }
 
+void lwkt_cpu_init_idle(void) {
+    struct cpu *cpu = this_cpu();
+    if (!cpu) {
+        return;
+    }
+
+    struct lwkt_thread *idle = &cpu->idle;
+    if (cpu->bsp) {
+        strcpy_local(idle->name, "idle");
+    } else {
+        idle->name[0] = 'i';
+        idle->name[1] = 'd';
+        idle->name[2] = '0' + (char)(cpu->id % 10);
+        idle->name[3] = '\0';
+    }
+    idle->id = 0;
+    idle->priority = LWKT_PRIO_LOW;
+    idle->state = THREAD_RUNNING;
+    idle->entry_point = idle_worker;
+    idle->arg = NULL;
+    idle->next = NULL;
+    idle->yields = 0;
+    idle->saved_kernel_rsp = 0;
+    idle->mbox_slot = 0;
+    idle->wait_next = NULL;
+    idle->uthread = NULL;
+    idle->user_cr3 = 0;
+    init_thread_stack(idle);
+    cpu->current = idle;
+}
+
 void lwkt_init(void) {
+    spin_init(&sched_lock);
     for (int i = 0; i < MAX_PRIORITY; i++) {
         run_queues[i] = NULL;
     }
@@ -176,43 +261,60 @@ void lwkt_init(void) {
         thread_pool[i].state = THREAD_TERMINATED;
     }
 
-    strcpy_local(idle_thread.name, "idle");
-    idle_thread.id = 0;
-    idle_thread.priority = LWKT_PRIO_LOW;
-    idle_thread.state = THREAD_RUNNING;
-    idle_thread.entry_point = idle_worker;
-    idle_thread.arg = NULL;
-    idle_thread.next = NULL;
-    idle_thread.yields = 0;
-    idle_thread.saved_kernel_rsp = 0;
-    idle_thread.mbox_slot = 0;
-    init_thread_stack(&idle_thread);
-
-    current_thread = &idle_thread;
+    lwkt_cpu_init_idle();
     thread_count = 0;
-    preempt_requested = 0;
     sched_active = 0;
 
     msgport_init();
 }
 
 void lwkt_sched_start(void) {
+    /* Timer and sched_active are enabled in smp_release_aps() right before bootstrap. */
+}
+
+void lwkt_sched_enable(void) {
+    struct cpu *cpu = this_cpu();
     if (!sched_active) {
-        timer_init();
         sched_active = 1;
+    }
+    if (cpu) {
+        cpu->sched_active = 1;
+    }
+}
+
+void lwkt_sched_ipi_others(void) {
+    if (cpu_online_count() > 1) {
+        lapic_ipi_reschedule_others();
     }
 }
 
 void lwkt_sched_stop(void) {
     timer_set_enabled(0);
+    lapic_timer_stop();
     sched_active = 0;
+    struct cpu *cpu = this_cpu();
+    if (cpu) {
+        cpu->sched_active = 0;
+    }
+}
+
+static void sched_lock_irqsave(uint64_t *irqf) {
+    spin_lock_irqsave(&sched_lock, irqf);
+}
+
+static void sched_unlock_irqrestore(uint64_t irqf) {
+    spin_unlock_irqrestore(&sched_lock, irqf);
 }
 
 struct lwkt_thread *lwkt_create(const char *name, void (*entry)(void *), void *arg, uint32_t priority) {
     if (priority >= MAX_PRIORITY) {
         priority = MAX_PRIORITY - 1;
     }
+
+    uint64_t irqf;
+    sched_lock_irqsave(&irqf);
     if (thread_count >= MAX_THREADS) {
+        sched_unlock_irqrestore(irqf);
         return NULL;
     }
 
@@ -224,6 +326,7 @@ struct lwkt_thread *lwkt_create(const char *name, void (*entry)(void *), void *a
         }
     }
     if (!t) {
+        sched_unlock_irqrestore(irqf);
         return NULL;
     }
 
@@ -250,15 +353,14 @@ struct lwkt_thread *lwkt_create(const char *name, void (*entry)(void *), void *a
     t->pending_cr3_destroy = 0;
     t->yields = 0;
     t->saved_kernel_rsp = 0;
+    t->wait_next = NULL;
     t->mbox_slot = (uint8_t)((t - thread_pool) + 1);
     init_thread_stack(t);
     enqueue_thread(t);
     thread_count++;
+    sched_unlock_irqrestore(irqf);
 
-    if (!sched_active) {
-        lwkt_sched_start();
-    }
-
+    lwkt_sched_ipi_others();
     return t;
 }
 
@@ -267,8 +369,11 @@ int lwkt_destroy(uint32_t id) {
         return -1;
     }
 
+    uint64_t irqf;
+    sched_lock_irqsave(&irqf);
     struct lwkt_thread *t = find_thread(id);
     if (!t) {
+        sched_unlock_irqrestore(irqf);
         return -1;
     }
 
@@ -284,18 +389,20 @@ int lwkt_destroy(uint32_t id) {
 
     t->state = THREAD_TERMINATED;
 
-    if (t != current_thread) {
+    struct cpu *cpu = this_cpu();
+    if (t != (cpu ? cpu->current : NULL)) {
         t->rsp = 0;
         t->id = 0;
         thread_count--;
     }
-
+    sched_unlock_irqrestore(irqf);
     return 0;
 }
 
 struct lwkt_thread *lwkt_find(uint32_t id) {
     if (id == 0) {
-        return &idle_thread;
+        struct cpu *cpu = this_cpu();
+        return cpu ? &cpu->idle : NULL;
     }
     return find_thread(id);
 }
@@ -315,87 +422,72 @@ void lwkt_info(uint32_t id) {
     console_write_dec(t->priority);
     console_writestring(" (0=highest)\n  State:    ");
     console_writestring(state_name(t->state));
-    if (t == current_thread) {
+    if (t == lwkt_curthread()) {
         console_writestring(" (current)");
     }
     console_writestring("\n  Yields:   ");
     console_write_dec(t->yields);
+    if (t->uthread) {
+        console_writestring("\n  Uthr slot:");
+        console_write_dec(uthread_slot_of(t->uthread));
+        console_writestring("  in-proc: ");
+        int pin = uthread_index_in_proc(t->uthread);
+        if (pin > 0) {
+            console_write_dec((uint64_t)pin);
+        } else {
+            console_putchar('-');
+        }
+        if (t->uthread->proc && t->uthread->proc->pid) {
+            console_writestring("  PID: ");
+            console_write_dec(t->uthread->proc->pid);
+        }
+    } else {
+        console_writestring("\n  Uthread:  (none)");
+    }
     console_writestring("\n  RSP:      0x");
     console_write_hex(t->rsp);
     console_putchar('\n');
 }
 
 void lwkt_list(void) {
-    console_writestring("\nID  Name            Prio  State      CR3\n");
-    console_writestring("--  --------------  ----  ---------  ---------------\n");
+    struct cpu *cpu = this_cpu();
+    struct lwkt_thread *current = cpu ? cpu->current : NULL;
 
-    if (current_thread) {
-        console_write_dec(current_thread->id);
-        console_writestring("  ");
-        console_writestring(current_thread->name);
-        console_writestring("  ");
-        console_write_dec(current_thread->priority);
-        console_writestring("     ");
-        console_writestring(state_name(current_thread->state));
-        console_writestring(" *  ");
-        if (current_thread->user_cr3) {
-            console_write_hex(current_thread->user_cr3);
-        } else {
-            console_writestring("-");
-        }
-        console_putchar('\n');
+    console_writestring("\nLWKT  Slot Proc  Name            Prio  State      CPU CR3\n");
+    console_writestring("----  ---- ----  --------------  ----  ---------  --- ---------------\n");
+
+    if (current) {
+        print_thread_row(current, 1);
     }
 
+    uint64_t irqf;
+    sched_lock_irqsave(&irqf);
     for (int p = 0; p < MAX_PRIORITY; p++) {
         for (struct lwkt_thread *t = run_queues[p]; t; t = t->next) {
-            if (t == current_thread || t->state == THREAD_TERMINATED) {
+            if (t == current || t->state == THREAD_TERMINATED) {
                 continue;
             }
-            console_write_dec(t->id);
-            console_writestring("  ");
-            console_writestring(t->name);
-            console_writestring("  ");
-            console_write_dec(t->priority);
-            console_writestring("     ");
-            console_writestring(state_name(t->state));
-            console_writestring("    ");
-            if (t->user_cr3) {
-                console_write_hex(t->user_cr3);
-            } else {
-                console_writestring("-");
-            }
-            console_putchar('\n');
+            print_thread_row(t, 0);
         }
     }
 
     for (int i = 0; i < MAX_THREADS; i++) {
         struct lwkt_thread *t = &thread_pool[i];
-        if (t->id == 0 || t == current_thread || t->state != THREAD_BLOCKED) {
+        if (t->id == 0 || t == current || t->state != THREAD_BLOCKED) {
             continue;
         }
-        console_write_dec(t->id);
-        console_writestring("  ");
-        console_writestring(t->name);
-        console_writestring("  ");
-        console_write_dec(t->priority);
-        console_writestring("     ");
-        console_writestring(state_name(t->state));
-        console_writestring("    ");
-        if (t->user_cr3) {
-            console_write_hex(t->user_cr3);
-        } else {
-            console_writestring("-");
-        }
-        console_putchar('\n');
+        print_thread_row(t, 0);
     }
+    sched_unlock_irqrestore(irqf);
 
     console_writestring("\nTotal: ");
-    console_write_dec((uint64_t)thread_count + 1);
-    console_writestring(" threads (incl. idle)\n");
+    console_write_dec((uint64_t)thread_count + cpu_online_count());
+    console_writestring(" threads (incl. idle per CPU)\n");
 }
 
 struct lwkt_thread *lwkt_curthread(void) {
-    return current_thread;
+    struct cpu *cpu = this_cpu();
+    return cpu ? cpu->current : NULL;
 }
 
 int lwkt_thread_count(void) {
@@ -416,14 +508,22 @@ static void lwkt_apply_tss(struct lwkt_thread *t) {
 }
 
 void lwkt_bootstrap_first(void) {
-    struct lwkt_thread *next = dequeue_thread(NULL);
+    struct cpu *cpu = this_cpu();
+    uint64_t irqf;
+
+    sched_lock_irqsave(&irqf);
+    struct lwkt_thread *next = dequeue_thread(cpu, NULL);
     if (!next) {
-        next = &idle_thread;
+        next = &cpu->idle;
     }
 
-    idle_thread.state = THREAD_READY;
-    current_thread = next;
+    cpu->idle.state = THREAD_READY;
+    cpu->current = next;
     next->state = THREAD_RUNNING;
+    sched_unlock_irqrestore(irqf);
+
+    /* Shell is RUNNING on BSP (not in queue); safe to wake AP schedulers. */
+    smp_start_aps();
 
     static uint64_t boot_saved_rsp;
     lwkt_apply_cr3(next);
@@ -432,48 +532,97 @@ void lwkt_bootstrap_first(void) {
     __builtin_unreachable();
 }
 
+void lwkt_ap_bootstrap(void) {
+    struct cpu *cpu = this_cpu();
+    if (!cpu) {
+        for (;;) {
+            __asm__ volatile("hlt");
+        }
+    }
+
+    lwkt_apply_cr3(&cpu->idle);
+    switch_context(&cpu->bootstrap_rsp, cpu->idle.rsp);
+    __builtin_unreachable();
+}
+
 void lwkt_preempt_request(void) {
-    if (sched_active) {
-        preempt_requested = 1;
+    struct cpu *cpu = this_cpu();
+    if (cpu && cpu->sched_active) {
+        cpu->preempt_requested = 1;
     }
 }
 
 void lwkt_preempt_check(void) {
-    if (preempt_requested) {
-        preempt_requested = 0;
-        lwkt_switch();
+    struct cpu *cpu = this_cpu();
+    if (!cpu || !cpu->preempt_requested || !cpu->sched_active) {
+        return;
     }
+
+    struct lwkt_thread *cur = cpu->current;
+    if (!cur) {
+        cpu->preempt_requested = 0;
+        return;
+    }
+
+    int other = 0;
+    if (!spin_trylock(&sched_lock)) {
+        return;
+    }
+    for (uint32_t p = 0; p < MAX_PRIORITY; p++) {
+        for (struct lwkt_thread *t = run_queues[p]; t; t = t->next) {
+            if (t != cur && t->state != THREAD_TERMINATED) {
+                other = 1;
+                break;
+            }
+        }
+        if (other) {
+            break;
+        }
+    }
+    spin_unlock(&sched_lock);
+
+    if (!other && cur == &cpu->idle) {
+        return;
+    }
+
+    cpu->preempt_requested = 0;
+    lwkt_switch();
 }
 
 void lwkt_switch(void) {
-    struct lwkt_thread *prev = current_thread;
+    struct cpu *cpu = this_cpu();
+    struct lwkt_thread *prev = cpu->current;
+    uint64_t irqf = cpu_irq_save();
 
+    spin_lock(&sched_lock);
     if (prev && prev->state == THREAD_RUNNING) {
         prev->state = THREAD_READY;
         prev->yields++;
         enqueue_thread(prev);
     }
 
-    struct lwkt_thread *next = dequeue_thread(prev);
+    struct lwkt_thread *next = dequeue_thread(cpu, prev);
     if (next == prev) {
         next->state = THREAD_RUNNING;
+        spin_unlock(&sched_lock);
+        cpu_irq_restore(irqf);
         return;
     }
 
     if (next->state == THREAD_TERMINATED) {
-        next = &idle_thread;
+        next = &cpu->idle;
     }
 
     next->state = THREAD_RUNNING;
-    current_thread = next;
+    cpu->current = next;
+    spin_unlock(&sched_lock);
 
     if (next->rsp == 0) {
-        if (next != &idle_thread) {
-            next = &idle_thread;
-            next->state = THREAD_RUNNING;
-            current_thread = next;
-        }
+        next = &cpu->idle;
+        next->state = THREAD_RUNNING;
+        cpu->current = next;
         if (next->rsp == 0) {
+            cpu_irq_restore(irqf);
             return;
         }
     }
@@ -487,7 +636,9 @@ void lwkt_switch(void) {
         vmm_aspace_destroy(destroy_cr3);
     }
 
+    cpu->switches++;
     switch_context(&prev->rsp, next->rsp);
+    cpu_irq_restore(irqf);
 }
 
 void lwkt_yield(void) {
@@ -495,7 +646,8 @@ void lwkt_yield(void) {
 }
 
 void lwkt_block(void) {
-    struct lwkt_thread *cur = current_thread;
+    struct cpu *cpu = this_cpu();
+    struct lwkt_thread *cur = cpu ? cpu->current : NULL;
     if (!cur || cur->state != THREAD_RUNNING) {
         return;
     }
@@ -507,17 +659,25 @@ void lwkt_unblock(struct lwkt_thread *t) {
     if (!t || t->state != THREAD_BLOCKED) {
         return;
     }
+    uint64_t irqf;
+    sched_lock_irqsave(&irqf);
     t->state = THREAD_READY;
     enqueue_thread(t);
+    sched_unlock_irqrestore(irqf);
+    lwkt_sched_ipi_others();
 }
 
 void lwkt_thread_exit(void) {
-    if (current_thread) {
-        remove_from_queues(current_thread);
-        msgport_clear_slot(current_thread->mbox_slot);
-        current_thread->state = THREAD_TERMINATED;
-        current_thread->entry_point = NULL;
-        current_thread->id = 0;
+    struct cpu *cpu = this_cpu();
+    if (cpu && cpu->current) {
+        uint64_t irqf;
+        sched_lock_irqsave(&irqf);
+        remove_from_queues(cpu->current);
+        sched_unlock_irqrestore(irqf);
+        msgport_clear_slot(cpu->current->mbox_slot);
+        cpu->current->state = THREAD_TERMINATED;
+        cpu->current->entry_point = NULL;
+        cpu->current->id = 0;
         thread_count--;
     }
     lwkt_yield();

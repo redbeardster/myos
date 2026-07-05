@@ -2,6 +2,7 @@
 
 #include "console.h"
 #include "lwkt.h"
+#include "uthread.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -287,4 +288,36 @@ int msg_pingdemo_pair(uint32_t *id_a, uint32_t *id_b) {
         *id_b = t2->id;
     }
     return 0;
+}
+
+static uint32_t msgd_lwkt_id;
+
+void msgd_worker(void *arg) {
+    (void)arg;
+    struct msg m;
+
+    for (;;) {
+        if (msg_receive(&m, 1) != 0) {
+            break;
+        }
+
+        if (m.type == MSG_TYPE_DATA) {
+            print_msg_line(&m);
+        } else if (m.type == MSG_TYPE_PING) {
+            msg_send(m.from, MSG_TYPE_PONG, m.data, m.size);
+        }
+    }
+}
+
+int msgd_start(void) {
+    struct uthread *u = uthread_spawn("msgd", msgd_worker, NULL, LWKT_PRIO_NORMAL);
+    if (!u || !u->lwkt) {
+        return -1;
+    }
+    msgd_lwkt_id = u->lwkt_id;
+    return 0;
+}
+
+uint32_t msgd_thread_id(void) {
+    return msgd_lwkt_id;
 }

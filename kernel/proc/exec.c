@@ -5,17 +5,14 @@
 #include "memory.h"
 #include "myos_abi.h"
 #include "proc.h"
+#include "user.h"
+#include "user_embeds.h"
 #include "uthread.h"
 #include "vmm.h"
 
 #include <limine.h>
 #include <stddef.h>
 #include <stdint.h>
-
-extern uint8_t _binary_user_hello_elf_start[];
-extern uint8_t _binary_user_hello_elf_end[];
-extern uint8_t _binary_user_shell_elf_start[];
-extern uint8_t _binary_user_shell_elf_end[];
 
 extern volatile struct limine_module_request module_request;
 
@@ -85,28 +82,23 @@ int exec_spawn_elf(const void *elf, size_t size, const char *name, uint32_t flag
         return -2;
     }
 
-    void *stack_page = alloc_page();
-    if (!stack_page) {
-        vmm_aspace_destroy(cr3);
-        return -3;
-    }
-
-    uint64_t stack_map = MYOS_USER_STACK_TOP - PAGE_SIZE;
-    if (vmm_map(cr3, stack_map, virt_to_phys(stack_page), PTE_WRITE) != 0) {
-        free_page(stack_page);
-        vmm_aspace_destroy(cr3);
-        return -4;
-    }
-
-    struct proc *p = proc_create(name, cr3, info.entry, MYOS_USER_STACK_TOP - 16, is_shell);
+    struct proc *p = proc_create(name, cr3, info.entry, 0, is_shell);
     if (!p) {
         vmm_aspace_destroy(cr3);
         return -5;
     }
 
+    uint64_t user_rsp, stack_base;
+    if (user_stack_alloc(p, &user_rsp, &stack_base) != 0) {
+        proc_destroy(p);
+        return -3;
+    }
+    p->user_stack = user_rsp;
+
     uint32_t prio = is_shell ? LWKT_PRIO_SHELL : LWKT_PRIO_NORMAL;
-    struct uthread *u = uthread_spawn_in_proc(p, info.entry, MYOS_USER_STACK_TOP - 16, prio);
+    struct uthread *u = uthread_spawn_in_proc(p, info.entry, user_rsp, 0, stack_base, prio);
     if (!u) {
+        user_stack_free(p, stack_base);
         proc_destroy(p);
         return -6;
     }
@@ -153,17 +145,11 @@ int exec_spawn_module(const char *name, uint32_t flags) {
         }
     }
 
-    if (path_ends_with(name, "shell.elf")) {
-        size_t size = (size_t)(_binary_user_shell_elf_end - _binary_user_shell_elf_start);
+    const struct user_embed *emb = user_embed_lookup(name);
+    if (emb) {
+        size_t size = user_embed_size(emb);
         if (size > 0) {
-            return spawn_from_blob(_binary_user_shell_elf_start, size, "shell.elf", flags);
-        }
-    }
-
-    if (path_ends_with(name, "hello.elf")) {
-        size_t size = (size_t)(_binary_user_hello_elf_end - _binary_user_hello_elf_start);
-        if (size > 0) {
-            return spawn_from_blob(_binary_user_hello_elf_start, size, "hello.elf", flags);
+            return spawn_from_blob(emb->start, size, emb->name, flags);
         }
     }
 

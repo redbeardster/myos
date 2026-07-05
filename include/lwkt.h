@@ -6,13 +6,13 @@
 struct uthread;
 
 #define MAX_THREADS 32
-#define MAX_PRIORITY 4
+#define MAX_PRIORITY 16
 #define STACK_SIZE 4096
 
 #define LWKT_PRIO_SHELL    0
-#define LWKT_PRIO_HIGH     1
-#define LWKT_PRIO_NORMAL   2
-#define LWKT_PRIO_LOW      3
+#define LWKT_PRIO_HIGH     2
+#define LWKT_PRIO_NORMAL   8
+#define LWKT_PRIO_LOW      15
 
 enum thread_state {
     THREAD_READY = 0,
@@ -36,12 +36,15 @@ struct lwkt_thread {
     uint64_t yields;
     uint64_t saved_kernel_rsp;
     uint8_t mbox_slot;
+    struct lwkt_thread *wait_next;
     uint8_t stack[STACK_SIZE];
 };
 
 void lwkt_init(void);
 void lwkt_sched_start(void);
 void lwkt_sched_stop(void);
+void lwkt_sched_enable(void);
+void lwkt_sched_ipi_others(void);
 
 struct lwkt_thread *lwkt_create(const char *name, void (*entry)(void *), void *arg, uint32_t priority);
 int lwkt_destroy(uint32_t id);
@@ -56,6 +59,9 @@ void lwkt_unblock(struct lwkt_thread *t);
 void lwkt_preempt_request(void);
 void lwkt_preempt_check(void);
 void lwkt_thread_exit(void);
+
+void lwkt_cpu_init_idle(void);
+void lwkt_ap_bootstrap(void);
 
 void lwkt_default_worker(void *arg);
 

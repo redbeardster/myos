@@ -1,6 +1,7 @@
 #include "keyboard.h"
 #include "io.h"
 #include "lwkt.h"
+#include "spinlock.h"
 
 #define KEYBOARD_PORT 0x60
 #define KBD_RING_SIZE 64
@@ -10,6 +11,7 @@ static volatile int kbd_head;
 static volatile int kbd_tail;
 
 static struct lwkt_thread *kbd_reader;
+static spinlock_t kbd_lock;
 
 static const char scancode_to_ascii[] = {
     0,   0,   '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', 0,
@@ -52,26 +54,36 @@ void keyboard_init(void) {
     shift_pressed = 0;
     caps_lock = 0;
     kbd_reader = NULL;
+    spin_init(&kbd_lock);
 }
 
 void keyboard_set_reader(struct lwkt_thread *t) {
+    uint64_t irqf;
+    spin_lock_irqsave(&kbd_lock, &irqf);
     kbd_reader = t;
+    spin_unlock_irqrestore(&kbd_lock, irqf);
 }
 
 void keyboard_clear_reader(struct lwkt_thread *t) {
+    uint64_t irqf;
+    spin_lock_irqsave(&kbd_lock, &irqf);
     if (kbd_reader == t) {
         kbd_reader = NULL;
     }
+    spin_unlock_irqrestore(&kbd_lock, irqf);
 }
 
 void keyboard_irq_handler(void) {
     ring_push(inb(KEYBOARD_PORT));
 
-    if (kbd_reader) {
-        struct lwkt_thread *t = kbd_reader;
-        kbd_reader = NULL;
+    uint64_t irqf;
+    spin_lock_irqsave(&kbd_lock, &irqf);
+    struct lwkt_thread *t = kbd_reader;
+    kbd_reader = NULL;
+    spin_unlock_irqrestore(&kbd_lock, irqf);
+
+    if (t) {
         lwkt_unblock(t);
-        lwkt_preempt_request();
     }
 }
 

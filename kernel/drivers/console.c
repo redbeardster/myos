@@ -1,5 +1,6 @@
 #include "console.h"
 #include "font.h"
+#include "spinlock.h"
 
 #define FONT_W 8
 #define CHAR_HEIGHT 16
@@ -12,6 +13,7 @@ static unsigned cursor_col;
 static unsigned cursor_row;
 static unsigned saved_col;
 static unsigned saved_row;
+static spinlock_t console_lock;
 
 static const uint32_t palette[16] = {
     0x000000, 0x0000AA, 0x00AA00, 0x00AAAA,
@@ -144,6 +146,7 @@ static void scroll_up(void) {
 }
 
 void console_init(struct limine_framebuffer *framebuffer) {
+    spin_init(&console_lock);
     fb = framebuffer;
     pixels = (volatile uint32_t *)fb->address;
     cursor_col = 0;
@@ -189,6 +192,7 @@ void console_clear(void) {
 }
 
 void console_putchar(char c) {
+    spin_lock(&console_lock);
     unsigned max_cols = fb ? (unsigned)(fb->width / FONT_W) : SCREEN_COLS;
     unsigned max_rows = fb ? (unsigned)(fb->height / CHAR_HEIGHT) : SCREEN_ROWS;
 
@@ -204,11 +208,13 @@ void console_putchar(char c) {
             cursor_col--;
             draw_char(cursor_col, cursor_row, ' ');
         }
+        spin_unlock(&console_lock);
         return;
     } else if (c >= ' ') {
         draw_char(cursor_col, cursor_row, c);
         cursor_col++;
     } else {
+        spin_unlock(&console_lock);
         return;
     }
 
@@ -220,6 +226,7 @@ void console_putchar(char c) {
     if (cursor_row >= max_rows) {
         scroll_up();
     }
+    spin_unlock(&console_lock);
 }
 
 void console_writestring(const char *str) {

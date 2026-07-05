@@ -1,6 +1,7 @@
 #include "memory.h"
 
 #include "console.h"
+#include "spinlock.h"
 
 #include <limine.h>
 #include <stdint.h>
@@ -15,6 +16,7 @@ static uint8_t page_bitmap[MAX_PHYS_PAGES / 8];
 static uint64_t hhdm;
 static uint64_t total_pages;
 static uint64_t free_count;
+static spinlock_t page_lock;
 
 static void bitmap_set(uint64_t page) {
     if (page >= MAX_PHYS_PAGES) {
@@ -56,6 +58,7 @@ static int memmap_usable(uint64_t type) {
 }
 
 void memory_init(struct limine_memmap_response *memmap, uint64_t hhdm_offset) {
+    spin_init(&page_lock);
     hhdm = hhdm_offset;
     total_pages = 0;
     free_count = 0;
@@ -103,13 +106,17 @@ uint64_t virt_to_phys(void *virt) {
 }
 
 void *alloc_page(void) {
+    spin_lock(&page_lock);
     for (uint64_t p = 0; p < MAX_PHYS_PAGES; p++) {
         if (!bitmap_test(p)) {
             bitmap_set(p);
             free_count--;
-            return phys_to_virt(p * PAGE_SIZE);
+            void *page = phys_to_virt(p * PAGE_SIZE);
+            spin_unlock(&page_lock);
+            return page;
         }
     }
+    spin_unlock(&page_lock);
     return NULL;
 }
 
@@ -117,13 +124,16 @@ void free_page(void *page) {
     if (!page) {
         return;
     }
+    spin_lock(&page_lock);
     uint64_t phys = virt_to_phys(page);
     uint64_t p = phys / PAGE_SIZE;
     if (p >= MAX_PHYS_PAGES || !bitmap_test(p)) {
+        spin_unlock(&page_lock);
         return;
     }
     bitmap_clear(p);
     free_count++;
+    spin_unlock(&page_lock);
 }
 
 void *alloc_pages(size_t count) {
@@ -131,6 +141,7 @@ void *alloc_pages(size_t count) {
         return NULL;
     }
 
+    spin_lock(&page_lock);
     for (uint64_t start = 0; start < MAX_PHYS_PAGES; start++) {
         int ok = 1;
         for (size_t i = 0; i < count; i++) {
@@ -147,8 +158,11 @@ void *alloc_pages(size_t count) {
             bitmap_set(start + i);
             free_count--;
         }
-        return phys_to_virt(start * PAGE_SIZE);
+        void *page = phys_to_virt(start * PAGE_SIZE);
+        spin_unlock(&page_lock);
+        return page;
     }
+    spin_unlock(&page_lock);
     return NULL;
 }
 
@@ -156,6 +170,7 @@ void free_pages(void *page, size_t count) {
     if (!page || count == 0) {
         return;
     }
+    spin_lock(&page_lock);
     uint64_t start = virt_to_phys(page) / PAGE_SIZE;
     for (size_t i = 0; i < count; i++) {
         uint64_t p = start + i;
@@ -164,6 +179,7 @@ void free_pages(void *page, size_t count) {
             free_count++;
         }
     }
+    spin_unlock(&page_lock);
 }
 
 uint64_t memory_total_pages(void) {

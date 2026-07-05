@@ -3,6 +3,8 @@
 #include "console.h"
 #include "lwkt.h"
 #include "myos_abi.h"
+#include "proc_mutex.h"
+#include "spinlock.h"
 #include "uthread.h"
 #include "vmm.h"
 
@@ -12,6 +14,7 @@
 
 static struct proc proc_table[MAX_PROCS];
 static uint32_t next_pid = 1;
+static spinlock_t proc_table_lock;
 
 static void strcpy_local(char *dst, const char *src) {
     while (*src) {
@@ -38,18 +41,52 @@ static struct proc *find_proc(uint32_t pid) {
     return NULL;
 }
 
+static int pid_in_use(uint32_t pid) {
+    return find_proc(pid) != NULL;
+}
+
+static uint32_t alloc_pid(void) {
+    for (uint32_t pid = 2; pid < next_pid; pid++) {
+        if (!pid_in_use(pid)) {
+            return pid;
+        }
+    }
+    return next_pid++;
+}
+
+static void proc_reset_slot(struct proc *p) {
+    if (!p) {
+        return;
+    }
+    p->pid = 0;
+    p->name[0] = '\0';
+    p->state = PROC_DEAD;
+    p->cr3 = 0;
+    p->entry = 0;
+    p->user_stack = 0;
+    p->heap_next = 0;
+    p->stack_next = 0;
+    p->is_shell = 0;
+    p->uthread_count = 0;
+    p->threads = NULL;
+    p->main_thread = NULL;
+    proc_mutex_init_all(p->mutexes, PROC_MUTEX_MAX);
+}
+
 static const char *state_name(enum proc_state state) {
     return state == PROC_RUNNING ? "running" : "dead";
 }
 
 struct proc *proc_create(const char *name, uint64_t cr3, uint64_t entry,
                          uint64_t user_stack, int is_shell) {
+    spin_lock(&proc_table_lock);
     struct proc *p = alloc_proc();
     if (!p) {
+        spin_unlock(&proc_table_lock);
         return NULL;
     }
 
-    p->pid = next_pid++;
+    p->pid = alloc_pid();
     if (name) {
         strcpy_local(p->name, name);
     } else {
@@ -62,10 +99,13 @@ struct proc *proc_create(const char *name, uint64_t cr3, uint64_t entry,
     p->entry = entry;
     p->user_stack = user_stack;
     p->heap_next = MYOS_USER_HEAP_START;
+    p->stack_next = MYOS_USER_STACK_TOP;
     p->is_shell = is_shell;
     p->uthread_count = 0;
     p->threads = NULL;
     p->main_thread = NULL;
+    proc_mutex_init_all(p->mutexes, PROC_MUTEX_MAX);
+    spin_unlock(&proc_table_lock);
     return p;
 }
 
@@ -89,12 +129,14 @@ void proc_attach_uthread(struct proc *p, struct uthread *u) {
     if (!p || !u) {
         return;
     }
+    spin_lock(&proc_table_lock);
     u->next_in_proc = p->threads;
     p->threads = u;
     p->uthread_count++;
     if (!p->main_thread) {
         p->main_thread = u;
     }
+    spin_unlock(&proc_table_lock);
 }
 
 void proc_detach_uthread(struct proc *p, struct uthread *u) {
@@ -102,6 +144,7 @@ void proc_detach_uthread(struct proc *p, struct uthread *u) {
         return;
     }
 
+    spin_lock(&proc_table_lock);
     struct uthread **slot = &p->threads;
     while (*slot) {
         if (*slot == u) {
@@ -111,10 +154,12 @@ void proc_detach_uthread(struct proc *p, struct uthread *u) {
             if (p->main_thread == u) {
                 p->main_thread = p->threads;
             }
+            spin_unlock(&proc_table_lock);
             return;
         }
         slot = &(*slot)->next_in_proc;
     }
+    spin_unlock(&proc_table_lock);
 }
 
 void proc_on_uthread_exit(struct proc *p, struct uthread *u) {
@@ -160,19 +205,16 @@ void proc_destroy(struct proc *p) {
         return;
     }
 
+    spin_lock(&proc_table_lock);
+
     if (p->cr3) {
         uint64_t cr3 = p->cr3;
         p->cr3 = 0;
         proc_destroy_aspace(cr3);
     }
 
-    p->state = PROC_DEAD;
-    p->is_shell = 0;
-    p->threads = NULL;
-    p->main_thread = NULL;
-    p->uthread_count = 0;
-    p->pid = 0;
-    p->name[0] = '\0';
+    proc_reset_slot(p);
+    spin_unlock(&proc_table_lock);
 }
 
 void proc_kill_children(void) {
@@ -243,4 +285,27 @@ void proc_list(void) {
     console_writestring("\nTotal: ");
     console_write_dec((uint64_t)count);
     console_writestring(" processes\n");
+}
+
+int proc_mutex_lock(uint32_t id) {
+    struct proc *p = proc_current();
+    if (!p) {
+        return -1;
+    }
+    return proc_mutex_lock_slot(p->mutexes, PROC_MUTEX_MAX, id);
+}
+
+int proc_mutex_unlock(uint32_t id) {
+    struct proc *p = proc_current();
+    if (!p) {
+        return -1;
+    }
+    return proc_mutex_unlock_slot(p->mutexes, PROC_MUTEX_MAX, id);
+}
+
+void proc_init(void) {
+    spin_init(&proc_table_lock);
+    for (int i = 0; i < MAX_PROCS; i++) {
+        proc_reset_slot(&proc_table[i]);
+    }
 }
