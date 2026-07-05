@@ -2,6 +2,8 @@
 
 #include "console.h"
 #include "lwkt.h"
+#include "spinlock.h"
+#include "token.h"
 #include "uthread.h"
 
 #include <stddef.h>
@@ -10,6 +12,8 @@
 #define MAX_MAILBOXES (MAX_THREADS + 1)
 
 struct mailbox {
+    struct token lock;
+    struct lwkt_thread *read_waiters;
     struct msg queue[MSG_QUEUE_DEPTH];
     int head;
     int tail;
@@ -17,6 +21,15 @@ struct mailbox {
 };
 
 static struct mailbox mailboxes[MAX_MAILBOXES];
+
+struct named_port {
+    char name[MSG_PORT_NAME_LEN];
+    uint32_t lwkt_id;
+    int in_use;
+};
+
+static struct named_port named_ports[MSG_PORT_MAX];
+static spinlock_t named_ports_lock;
 
 #define MAX_PING_CTX 8
 static struct ping_ctx ping_ctx_pool[MAX_PING_CTX];
@@ -46,19 +59,34 @@ static void memcpy_local(void *dst, const void *src, uint32_t n) {
     }
 }
 
-static void irq_disable(void) {
-    __asm__ volatile("cli");
-}
-
-static void irq_enable(void) {
-    __asm__ volatile("sti");
-}
-
 static struct mailbox *mbox_for_thread(struct lwkt_thread *t) {
     if (!t || t->mbox_slot >= MAX_MAILBOXES) {
         return NULL;
     }
     return &mailboxes[t->mbox_slot];
+}
+
+static void read_wait_enqueue(struct mailbox *mb, struct lwkt_thread *self) {
+    self->mbox_wait_next = NULL;
+    if (!mb->read_waiters) {
+        mb->read_waiters = self;
+        return;
+    }
+    struct lwkt_thread *tail = mb->read_waiters;
+    while (tail->mbox_wait_next) {
+        tail = tail->mbox_wait_next;
+    }
+    tail->mbox_wait_next = self;
+}
+
+static struct lwkt_thread *read_wait_dequeue(struct mailbox *mb) {
+    struct lwkt_thread *w = mb->read_waiters;
+    if (!w) {
+        return NULL;
+    }
+    mb->read_waiters = w->mbox_wait_next;
+    w->mbox_wait_next = NULL;
+    return w;
 }
 
 static int mbox_push(struct mailbox *mb, const struct msg *m) {
@@ -82,7 +110,15 @@ static int mbox_pop(struct mailbox *mb, struct msg *out) {
 }
 
 void msgport_init(void) {
+    spin_init(&named_ports_lock);
+    for (int i = 0; i < MSG_PORT_MAX; i++) {
+        named_ports[i].in_use = 0;
+        named_ports[i].name[0] = '\0';
+        named_ports[i].lwkt_id = 0;
+    }
     for (int i = 0; i < MAX_MAILBOXES; i++) {
+        token_init(&mailboxes[i].lock);
+        mailboxes[i].read_waiters = NULL;
         mailboxes[i].head = 0;
         mailboxes[i].tail = 0;
         mailboxes[i].count = 0;
@@ -93,11 +129,143 @@ void msgport_clear_slot(uint8_t slot) {
     if (slot >= MAX_MAILBOXES) {
         return;
     }
-    irq_disable();
-    mailboxes[slot].head = 0;
-    mailboxes[slot].tail = 0;
-    mailboxes[slot].count = 0;
-    irq_enable();
+
+    struct mailbox *mb = &mailboxes[slot];
+    token_lock(&mb->lock);
+    for (struct lwkt_thread *w = mb->read_waiters; w; w = w->mbox_wait_next) {
+        w->mbox_wait_next = NULL;
+    }
+    mb->read_waiters = NULL;
+    mb->head = 0;
+    mb->tail = 0;
+    mb->count = 0;
+    token_unlock(&mb->lock);
+}
+
+static void strcpy_port_name(char *dst, const char *src) {
+    int i = 0;
+    while (src[i] && i < MSG_PORT_NAME_LEN - 1) {
+        dst[i] = src[i];
+        i++;
+    }
+    dst[i] = '\0';
+}
+
+int msgport_register(const char *name, struct lwkt_thread *owner) {
+    if (!name || !name[0] || !owner || owner->id == 0) {
+        return -1;
+    }
+
+    uint64_t irqf;
+    spin_lock_irqsave(&named_ports_lock, &irqf);
+
+    for (int i = 0; i < MSG_PORT_MAX; i++) {
+        if (named_ports[i].in_use &&
+            named_ports[i].lwkt_id == owner->id) {
+            strcpy_port_name(named_ports[i].name, name);
+            spin_unlock_irqrestore(&named_ports_lock, irqf);
+            return 0;
+        }
+    }
+
+    for (int i = 0; i < MSG_PORT_MAX; i++) {
+        if (!named_ports[i].in_use) {
+            strcpy_port_name(named_ports[i].name, name);
+            named_ports[i].lwkt_id = owner->id;
+            named_ports[i].in_use = 1;
+            spin_unlock_irqrestore(&named_ports_lock, irqf);
+            return 0;
+        }
+    }
+
+    spin_unlock_irqrestore(&named_ports_lock, irqf);
+    return -2;
+}
+
+void msgport_unregister_id(uint32_t lwkt_id) {
+    if (lwkt_id == 0) {
+        return;
+    }
+
+    uint64_t irqf;
+    spin_lock_irqsave(&named_ports_lock, &irqf);
+    for (int i = 0; i < MSG_PORT_MAX; i++) {
+        if (named_ports[i].in_use && named_ports[i].lwkt_id == lwkt_id) {
+            named_ports[i].in_use = 0;
+            named_ports[i].name[0] = '\0';
+            named_ports[i].lwkt_id = 0;
+        }
+    }
+    spin_unlock_irqrestore(&named_ports_lock, irqf);
+}
+
+int msgport_lookup(const char *name) {
+    if (!name || !name[0]) {
+        return -1;
+    }
+
+    uint64_t irqf;
+    spin_lock_irqsave(&named_ports_lock, &irqf);
+    for (int i = 0; i < MSG_PORT_MAX; i++) {
+        if (!named_ports[i].in_use) {
+            continue;
+        }
+        const char *a = name;
+        const char *b = named_ports[i].name;
+        int match = 1;
+        for (int j = 0; j < MSG_PORT_NAME_LEN; j++) {
+            if (*a != *b) {
+                match = 0;
+                break;
+            }
+            if (*a == '\0') {
+                break;
+            }
+            a++;
+            b++;
+        }
+        if (match) {
+            int id = (int)named_ports[i].lwkt_id;
+            spin_unlock_irqrestore(&named_ports_lock, irqf);
+            return id;
+        }
+    }
+    spin_unlock_irqrestore(&named_ports_lock, irqf);
+    return -1;
+}
+
+int msg_send_name(const char *name, uint32_t type, const void *data, uint32_t size) {
+    int id = msgport_lookup(name);
+    if (id < 0) {
+        return -1;
+    }
+    return msg_send((uint32_t)id, type, data, size);
+}
+
+void msgport_list(void) {
+    console_writestring("\nNamed msgports:\n");
+    console_writestring("  Name            LWKT id\n");
+    console_writestring("  --------------  -------\n");
+
+    uint64_t irqf;
+    spin_lock_irqsave(&named_ports_lock, &irqf);
+    int count = 0;
+    for (int i = 0; i < MSG_PORT_MAX; i++) {
+        if (!named_ports[i].in_use) {
+            continue;
+        }
+        count++;
+        console_writestring("  ");
+        console_writestring(named_ports[i].name);
+        console_writestring("  ");
+        console_write_dec(named_ports[i].lwkt_id);
+        console_putchar('\n');
+    }
+    spin_unlock_irqrestore(&named_ports_lock, irqf);
+
+    console_writestring("\nTotal: ");
+    console_write_dec((uint64_t)count);
+    console_writestring(" port(s)\n");
 }
 
 int msg_send(uint32_t to_id, uint32_t type, const void *data, uint32_t size) {
@@ -123,17 +291,17 @@ int msg_send(uint32_t to_id, uint32_t type, const void *data, uint32_t size) {
         return -1;
     }
 
-    irq_disable();
+    struct lwkt_thread *wake = NULL;
+    token_lock(&mb->lock);
     if (mbox_push(mb, &m) != 0) {
-        irq_enable();
+        token_unlock(&mb->lock);
         return -3;
     }
-
-    int wake = (to->state == THREAD_BLOCKED);
-    irq_enable();
+    wake = read_wait_dequeue(mb);
+    token_unlock(&mb->lock);
 
     if (wake) {
-        lwkt_unblock(to);
+        lwkt_unblock(wake);
     }
     return 0;
 }
@@ -162,20 +330,36 @@ int msg_receive(struct msg *out, int block) {
             return -1;
         }
 
-        irq_disable();
+        if (block) {
+            token_lock(&mb->lock);
+        } else if (!token_trylock(&mb->lock)) {
+            return 1;
+        }
+
         if (mbox_pop(mb, out) == 0) {
-            irq_enable();
+            token_unlock(&mb->lock);
             if (out->type == MSG_TYPE_WAKEUP || self->state == THREAD_TERMINATED) {
                 return -1;
             }
             return 0;
         }
-        irq_enable();
 
         if (!block) {
+            token_unlock(&mb->lock);
             return 1;
         }
 
+        int already = 0;
+        for (struct lwkt_thread *w = mb->read_waiters; w; w = w->mbox_wait_next) {
+            if (w == self) {
+                already = 1;
+                break;
+            }
+        }
+        if (!already) {
+            read_wait_enqueue(mb, self);
+        }
+        token_unlock(&mb->lock);
         lwkt_block();
     }
 }
@@ -209,16 +393,19 @@ int msgport_wakeup(struct lwkt_thread *t) {
     struct msg wake = {0};
     wake.type = MSG_TYPE_WAKEUP;
 
-    irq_disable();
+    struct lwkt_thread *reader = NULL;
+    token_lock(&mb->lock);
     int rc = mbox_push(mb, &wake);
-    int blocked = (t->state == THREAD_BLOCKED);
-    irq_enable();
+    if (rc == 0) {
+        reader = read_wait_dequeue(mb);
+    }
+    token_unlock(&mb->lock);
 
     if (rc != 0) {
         return -1;
     }
-    if (blocked) {
-        lwkt_unblock(t);
+    if (reader) {
+        lwkt_unblock(reader);
     }
     return 0;
 }
@@ -315,6 +502,9 @@ int msgd_start(void) {
         return -1;
     }
     msgd_lwkt_id = u->lwkt_id;
+    if (msgport_register("msgd", u->lwkt) != 0) {
+        console_writestring("msgport_register(msgd) failed\n");
+    }
     return 0;
 }
 

@@ -30,13 +30,15 @@ struct lwkt_thread {
     void *arg;
     struct uthread *uthread;
     struct lwkt_thread *next;
+    uint32_t run_cpu;
     uint64_t rsp;
     uint64_t user_cr3;
     uint64_t pending_cr3_destroy;
     uint64_t yields;
     uint64_t saved_kernel_rsp;
     uint8_t mbox_slot;
-    struct lwkt_thread *wait_next;
+    struct lwkt_thread *wait_next;      /* token / proc_mutex wait queues */
+    struct lwkt_thread *mbox_wait_next; /* msgport read_waiters only */
     uint8_t stack[STACK_SIZE];
 };
 

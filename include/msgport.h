@@ -8,10 +8,15 @@ struct lwkt_thread;
 #define MSG_MAX_PAYLOAD 64
 #define MSG_QUEUE_DEPTH 8
 
-#define MSG_TYPE_DATA 0
-#define MSG_TYPE_PING 1
-#define MSG_TYPE_PONG 2
-#define MSG_TYPE_WAKEUP 0xFE
+#define MSG_TYPE_DATA     0
+#define MSG_TYPE_PING     1
+#define MSG_TYPE_PONG     2
+#define MSG_TYPE_KBD_CHAR 0x10
+#define MSG_TYPE_KBD_WAIT 0x11
+#define MSG_TYPE_WAKEUP   0xFE
+
+#define MSG_PORT_MAX      16
+#define MSG_PORT_NAME_LEN 16
 
 struct msg {
     uint32_t from;
@@ -31,6 +36,12 @@ int msg_pingdemo_pair(uint32_t *id_a, uint32_t *id_b);
 
 void msgport_init(void);
 void msgport_clear_slot(uint8_t slot);
+
+int  msgport_register(const char *name, struct lwkt_thread *owner);
+void msgport_unregister_id(uint32_t lwkt_id);
+int  msgport_lookup(const char *name);
+int  msg_send_name(const char *name, uint32_t type, const void *data, uint32_t size);
+void msgport_list(void);
 
 int msg_send(uint32_t to_id, uint32_t type, const void *data, uint32_t size);
 int msg_receive(struct msg *out, int block);

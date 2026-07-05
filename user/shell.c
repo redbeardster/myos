@@ -84,7 +84,8 @@ static void cmd_help(void) {
     write_str("  uthreads        - list uthreads (slot, proc, lwkt)\n");
     write_str("  cpus            - SMP CPU status (per-CPU scheduler)\n");
     write_str("  threads         - list LWKT scheduler threads\n");
-    write_str("  msg <text>      - send message to msgd kernel thread\n");
+    write_str("  ports           - list named msgports\n");
+    write_str("  msg [port] text - send to msgport (default msgd)\n");
     write_str("  ping            - msgport ping/pong with msgd\n");
     write_str("  yield           - syscall yield test\n");
 }
@@ -129,6 +130,11 @@ static void run_command(char *line) {
         return;
     }
 
+    if (str_eq(line, "ports")) {
+        myos_msg_ports();
+        return;
+    }
+
     if (str_eq(line, "ping")) {
         long rc = myos_msg_ping();
         if (rc < 0) {
@@ -138,24 +144,39 @@ static void run_command(char *line) {
     }
 
     if (str_starts(line, "msg ")) {
-        long msgd = myos_msgd_id();
-        if (msgd < 0) {
-            write_str("\nmsgd not available\n");
+        const char *args = line + 4;
+        skip_spaces(&args);
+        if (*args == '\0') {
+            write_str("\nusage: msg [port] <text>\n");
             return;
         }
-        const char *text = line + 4;
-        while (*text == ' ') {
-            text++;
+
+        char word[16];
+        int wi = 0;
+        while (args[wi] && args[wi] != ' ' && wi < 15) {
+            word[wi] = args[wi];
+            wi++;
         }
+        word[wi] = '\0';
+
+        const char *port = "msgd";
+        const char *text = args;
+        if (wi > 0 && args[wi] == ' ' && myos_port_lookup(word) > 0) {
+            port = word;
+            text = args + wi;
+            skip_spaces(&text);
+        }
+
         if (*text == '\0') {
-            write_str("\nusage: msg <text>\n");
+            write_str("\nusage: msg [port] <text>\n");
             return;
         }
+
         unsigned long len = str_len(text);
         if (len > 60) {
             len = 60;
         }
-        long rc = myos_msg_send(msgd, text, len);
+        long rc = myos_msg_send_name(port, text, len);
         if (rc < 0) {
             write_str("\nmsg send failed\n");
         }

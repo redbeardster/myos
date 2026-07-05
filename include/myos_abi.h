@@ -37,6 +37,9 @@
 #define MYOS_SYS_MUTEX_LOCK    16
 #define MYOS_SYS_MUTEX_UNLOCK  17
 #define MYOS_SYS_CPUS          18
+#define MYOS_SYS_MSG_SEND_NAME 19
+#define MYOS_SYS_PORT_LOOKUP   20
+#define MYOS_SYS_MSG_PORTS     21
 
 #define MYOS_PROC_MUTEX_MAX    8
 

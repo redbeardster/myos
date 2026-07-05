@@ -79,6 +79,9 @@ static struct cpu *cpu_alloc(uint32_t lapic_id, int bsp) {
     c->sched_active = 0;
     c->bootstrap_rsp = 0;
     c->switches = 0;
+    for (int i = 0; i < MAX_PRIORITY; i++) {
+        c->run_queues[i] = NULL;
+    }
     return c;
 }
 

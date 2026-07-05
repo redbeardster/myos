@@ -9,25 +9,25 @@
 
 ```
                     ┌─────────────────────────────────┐
-                    │  Global LWKT run_queues[]       │
-                    │  + spinlock sched_lock          │
+                    │  sched_lock (global, фаза 1)    │
                     └───────────────┬─────────────────┘
                                     │
          ┌──────────────────────────┼──────────────────────────┐
          ▼                          ▼                          ▼
    ┌───────────┐            ┌───────────┐            ┌───────────┐
    │ CPU 0 BSP │            │ CPU 1 AP  │            │ CPU N AP  │
-   │ GS→cpu[0] │            │ GS→cpu[1] │            │ GS→cpu[N] │
+   │ run_queues│            │ run_queues│            │ run_queues│
    │ idle/cur  │            │ idle/cur  │            │ idle/cur  │
-   │ TSS[0]    │            │ TSS[1]    │            │ TSS[N]    │
-   │ LAPIC ti  │            │ LAPIC ti  │            │ LAPIC ti  │
+   │ work steal│◄──────────►│ work steal│            │           │
    └───────────┘            └───────────┘            └───────────┘
 ```
 
-- **Один пул** `thread_pool[]` и **одна** глобальная очередь приоритетов.
-- **Per-CPU:** `current`, `idle`, `preempt_requested`, `sched_active`, свой TSS.
-- **Миграция потоков** между CPU возможна (поток снимается с очереди на CPU A,
-  может выполняться на CPU B) — явного pin пока нет.
+- **Per-CPU** `run_queues[MAX_PRIORITY]` в `struct cpu`.
+- Поток ставится в очередь **текущего CPU** (`enqueue_thread`).
+- Пустой CPU **крадёт** поток с другого CPU (`dequeue_thread`).
+- Общий пул `thread_pool[]` без изменений.
+
+Дорожная карта: [ROADMAP.md](ROADMAP.md).
 
 ---
 
@@ -113,9 +113,11 @@ threads           # колонка CPU у running-потоков
 
 ## 7. Ограничения
 
-- Нет per-CPU run queue и балансировки (одна глобальная очередь).
-- `msgport` всё ещё использует `cli`/`sti` — нужна доработка под SMP.
+- `sched_lock` пока глобальный (per-CPU lock — опционально в ROADMAP).
 - IPI broadcast «всем кроме себя» — простой wake; без точечной доставки на один CPU.
+- Work steal без affinity — поток может переехать на другой CPU после steal.
+
+`msgport` переведён на **sleepable token** (см. [TOKEN.md](TOKEN.md)).
 
 ---
 
@@ -128,14 +130,17 @@ threads           # колонка CPU у running-потоков
 | `kernel/arch/x86_64/lapic.c` | LAPIC MMIO, timer |
 | `kernel/arch/x86_64/gdt.c` | TSS per CPU |
 | `kernel/sched/lwkt.c` | Планировщик + `sched_lock` |
+| `kernel/sched/token.c` | Sleepable token |
+| `kernel/sched/msgport.c` | Почта LWKT под token |
 | `kernel/main.c` | `limine_smp_request` |
 
 ---
 
 ## 9. Следующие шаги
 
-- Spinlock в `msgport.c` вместо `cli`
-- Per-CPU run queue (опционально)
+См. [ROADMAP.md](ROADMAP.md): `token_shared`, `proc_mutex`→token, msgport по имени, `kbdd` IPC.
+
 - Точечный IPI на конкретный lapic_id
+- Shared (read) token для read-mostly подсистем
 
 См. [DEVELOPMENT.md](DEVELOPMENT.md), [THREADS_DEMO.md](THREADS_DEMO.md).

@@ -4,6 +4,7 @@
 #include "cpu.h"
 #include "exec.h"
 #include "keyboard.h"
+#include "kbdd.h"
 #include "lwkt.h"
 #include "memory.h"
 #include "msgport.h"
@@ -58,20 +59,17 @@ static int sys_read(uint64_t fd) {
         return -1;
     }
 
-    struct lwkt_thread *self = lwkt_curthread();
-
-    for (;;) {
-        char c = keyboard_poll_char();
-        if (c != 0) {
-            keyboard_clear_reader(self);
-            lwkt_preempt_check();
-            return (int)(unsigned char)c;
-        }
-
-        keyboard_set_reader(self);
-        lwkt_block();
-        lwkt_preempt_check();
+    if (!lwkt_curthread()) {
+        return -1;
     }
+
+    int c = kbdd_request_char();
+    if (c < 0) {
+        return -1;
+    }
+
+    lwkt_preempt_check();
+    return c;
 }
 
 static int sys_exec(const char *name) {
@@ -150,13 +148,8 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3) {
             break;
 
         case SYS_MSG_PING: {
-            uint32_t msgd = msgd_thread_id();
-            if (msgd == 0) {
-                ret = (uint64_t)-1;
-                break;
-            }
             static const char ping[] = "ping";
-            if (msg_send(msgd, MSG_TYPE_PING, ping, 4) != 0) {
+            if (msg_send_name("msgd", MSG_TYPE_PING, ping, 4) != 0) {
                 ret = (uint64_t)-2;
                 break;
             }
@@ -238,6 +231,40 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3) {
 
         case SYS_CPUS:
             cpu_list();
+            ret = 0;
+            break;
+
+        case SYS_MSG_SEND_NAME: {
+            char port[MSG_PORT_NAME_LEN];
+            char tmp[MSG_MAX_PAYLOAD];
+            if (copy_user_string(port, (const char *)(uintptr_t)a1, sizeof(port)) != 0) {
+                ret = (uint64_t)-1;
+                break;
+            }
+            uint64_t len = a3;
+            if (len > MSG_MAX_PAYLOAD) {
+                ret = (uint64_t)-2;
+                break;
+            }
+            if (len > 0) {
+                copy_from_user(tmp, (const char *)(uintptr_t)a2, len);
+            }
+            ret = (uint64_t)(int64_t)msg_send_name(port, MSG_TYPE_DATA, tmp, (uint32_t)len);
+            break;
+        }
+
+        case SYS_PORT_LOOKUP: {
+            char port[MSG_PORT_NAME_LEN];
+            if (copy_user_string(port, (const char *)(uintptr_t)a1, sizeof(port)) != 0) {
+                ret = (uint64_t)-1;
+                break;
+            }
+            ret = (uint64_t)(int64_t)msgport_lookup(port);
+            break;
+        }
+
+        case SYS_MSG_PORTS:
+            msgport_list();
             ret = 0;
             break;
 

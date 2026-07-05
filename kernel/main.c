@@ -9,11 +9,13 @@
 #include "gdt.h"
 #include "interrupt.h"
 #include "keyboard.h"
+#include "kbdd.h"
 #include "lwkt.h"
 #include "memory.h"
 #include "msgport.h"
 #include "proc.h"
 #include "syscall.h"
+#include "token.h"
 #include "vmm.h"
 
 __attribute__((used, section(".limine_requests")))
@@ -114,6 +116,21 @@ void kmain(void) {
     } else {
         console_writestring("msgd kernel message thread started (LWKT id ");
         console_write_dec(msgd_thread_id());
+        console_writestring(")\n");
+    }
+
+    if (token_shared_selftest() != 0) {
+        console_writestring("token_shared selftest FAILED\n");
+    } else {
+        console_writestring("token_shared selftest OK\n");
+    }
+    token_shared_mp_selftest_start();
+
+    if (kbdd_start() < 0) {
+        console_writestring("Failed to start kbdd keyboard thread\n");
+    } else {
+        console_writestring("kbdd keyboard thread started (LWKT id ");
+        console_write_dec(kbdd_thread_id());
         console_writestring(")\n");
     }
 

@@ -29,7 +29,9 @@ KERNEL_C = \
 	kernel/drivers/keyboard.c \
 	kernel/sched/lwkt.c \
 	kernel/sched/uthread.c \
+	kernel/sched/token.c \
 	kernel/sched/msgport.c \
+	kernel/sched/kbdd.c \
 	kernel/mm/memory.c \
 	kernel/mm/vmm.c \
 	kernel/syscall/syscall.c \

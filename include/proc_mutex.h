@@ -4,15 +4,12 @@
 #include <stdint.h>
 
 #include "myos_abi.h"
-#include "lwkt.h"
-#include "spinlock.h"
+#include "token.h"
 
 #define PROC_MUTEX_MAX MYOS_PROC_MUTEX_MAX
 
 struct proc_mutex {
-    spinlock_t guard;
-    int locked;
-    struct lwkt_thread *waiters;
+    struct token lock;
 };
 
 void proc_mutex_init_all(struct proc_mutex *mutexes, int count);

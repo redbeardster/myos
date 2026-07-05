@@ -1,6 +1,7 @@
 #include "keyboard.h"
+
 #include "io.h"
-#include "lwkt.h"
+#include "kbdd.h"
 #include "spinlock.h"
 
 #define KEYBOARD_PORT 0x60
@@ -10,7 +11,6 @@ static volatile uint8_t kbd_ring[KBD_RING_SIZE];
 static volatile int kbd_head;
 static volatile int kbd_tail;
 
-static struct lwkt_thread *kbd_reader;
 static spinlock_t kbd_lock;
 
 static const char scancode_to_ascii[] = {
@@ -30,7 +30,7 @@ static const char scancode_to_ascii_shift[] = {
 static int shift_pressed;
 static int caps_lock;
 
-static void ring_push(uint8_t scancode) {
+static void ring_push_locked(uint8_t scancode) {
     int next = (kbd_head + 1) % KBD_RING_SIZE;
     if (next == kbd_tail) {
         return;
@@ -39,7 +39,7 @@ static void ring_push(uint8_t scancode) {
     kbd_head = next;
 }
 
-static int ring_pop(uint8_t *scancode) {
+static int ring_pop_locked(uint8_t *scancode) {
     if (kbd_head == kbd_tail) {
         return 0;
     }
@@ -53,53 +53,41 @@ void keyboard_init(void) {
     kbd_tail = 0;
     shift_pressed = 0;
     caps_lock = 0;
-    kbd_reader = NULL;
     spin_init(&kbd_lock);
 }
 
-void keyboard_set_reader(struct lwkt_thread *t) {
-    uint64_t irqf;
-    spin_lock_irqsave(&kbd_lock, &irqf);
-    kbd_reader = t;
-    spin_unlock_irqrestore(&kbd_lock, irqf);
-}
-
-void keyboard_clear_reader(struct lwkt_thread *t) {
-    uint64_t irqf;
-    spin_lock_irqsave(&kbd_lock, &irqf);
-    if (kbd_reader == t) {
-        kbd_reader = NULL;
-    }
-    spin_unlock_irqrestore(&kbd_lock, irqf);
-}
-
 void keyboard_irq_handler(void) {
-    ring_push(inb(KEYBOARD_PORT));
+    uint8_t scancode = inb(KEYBOARD_PORT);
 
     uint64_t irqf;
     spin_lock_irqsave(&kbd_lock, &irqf);
-    struct lwkt_thread *t = kbd_reader;
-    kbd_reader = NULL;
+    ring_push_locked(scancode);
     spin_unlock_irqrestore(&kbd_lock, irqf);
 
-    if (t) {
-        lwkt_unblock(t);
+    kbdd_irq_notify();
+}
+
+int keyboard_scancode_pending(void) {
+    uint64_t irqf;
+    spin_lock_irqsave(&kbd_lock, &irqf);
+    int has = kbd_head != kbd_tail;
+    spin_unlock_irqrestore(&kbd_lock, irqf);
+    return has;
+}
+
+int keyboard_pop_scancode(uint8_t *scancode) {
+    if (!scancode) {
+        return 0;
     }
+
+    uint64_t irqf;
+    spin_lock_irqsave(&kbd_lock, &irqf);
+    int ok = ring_pop_locked(scancode);
+    spin_unlock_irqrestore(&kbd_lock, irqf);
+    return ok;
 }
 
-int keyboard_has_scancode(void) {
-    return kbd_head != kbd_tail;
-}
-
-uint8_t keyboard_read_scancode(void) {
-    uint8_t scancode = 0;
-    while (!ring_pop(&scancode)) {
-        __asm__ volatile("hlt");
-    }
-    return scancode;
-}
-
-static char translate_scancode(uint8_t scancode) {
+char keyboard_translate_scancode(uint8_t scancode) {
     if (scancode == 0x2A || scancode == 0x36) {
         shift_pressed = 1;
         return 0;
@@ -117,33 +105,8 @@ static char translate_scancode(uint8_t scancode) {
         return 0;
     }
 
-    char c;
     if (shift_pressed || caps_lock) {
-        c = scancode_to_ascii_shift[scancode];
-    } else {
-        c = scancode_to_ascii[scancode];
+        return scancode_to_ascii_shift[scancode];
     }
-    return c;
-}
-
-char keyboard_poll_char(void) {
-    uint8_t scancode;
-
-    while (ring_pop(&scancode)) {
-        char c = translate_scancode(scancode);
-        if (c != 0) {
-            return c;
-        }
-    }
-    return 0;
-}
-
-char keyboard_read_char(void) {
-    for (;;) {
-        char c = keyboard_poll_char();
-        if (c != 0) {
-            return c;
-        }
-        __asm__ volatile("hlt");
-    }
+    return scancode_to_ascii[scancode];
 }

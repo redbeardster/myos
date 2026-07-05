@@ -18,46 +18,58 @@ extern void switch_context(uint64_t *old_rsp, uint64_t new_rsp);
 extern void thread_bootstrap(void);
 
 static struct lwkt_thread thread_pool[MAX_THREADS];
-static struct lwkt_thread *run_queues[MAX_PRIORITY];
 static spinlock_t sched_lock;
 static int thread_count;
 static uint32_t next_id = 1;
 static int sched_active;
 
-static void strcpy_local(char *dst, const char *src) {
-    while (*src) {
-        *dst++ = *src++;
+static struct cpu *this_cpu(void);
+static void strcpy_local(char *dst, const char *src);
+
+static void cpu_run_queues_init(struct cpu *cpu) {
+    if (!cpu) {
+        return;
     }
-    *dst = '\0';
+    for (int i = 0; i < MAX_PRIORITY; i++) {
+        cpu->run_queues[i] = NULL;
+    }
 }
 
-static struct cpu *this_cpu(void) {
-    return cpu_current();
-}
-
-static void enqueue_thread(struct lwkt_thread *t) {
-    if (!t || t->state == THREAD_TERMINATED) {
+static void enqueue_on_cpu(struct cpu *cpu, struct lwkt_thread *t) {
+    if (!cpu || !t || t->state == THREAD_TERMINATED) {
         return;
     }
 
     uint32_t p = t->priority;
     t->next = NULL;
+    t->run_cpu = cpu->id;
 
-    if (!run_queues[p]) {
-        run_queues[p] = t;
+    if (!cpu->run_queues[p]) {
+        cpu->run_queues[p] = t;
         return;
     }
 
-    struct lwkt_thread *tail = run_queues[p];
+    struct lwkt_thread *tail = cpu->run_queues[p];
     while (tail->next) {
         tail = tail->next;
     }
     tail->next = t;
 }
 
-static int remove_from_queues(struct lwkt_thread *t) {
+static void enqueue_thread(struct lwkt_thread *t) {
+    struct cpu *cpu = this_cpu();
+    if (!cpu) {
+        cpu = cpu_by_id(0);
+    }
+    enqueue_on_cpu(cpu, t);
+}
+
+static int remove_from_cpu_queues(struct cpu *cpu, struct lwkt_thread *t) {
+    if (!cpu || !t) {
+        return 0;
+    }
     for (int p = 0; p < MAX_PRIORITY; p++) {
-        struct lwkt_thread **slot = &run_queues[p];
+        struct lwkt_thread **slot = &cpu->run_queues[p];
         while (*slot) {
             if (*slot == t) {
                 *slot = t->next;
@@ -70,11 +82,27 @@ static int remove_from_queues(struct lwkt_thread *t) {
     return 0;
 }
 
-static struct lwkt_thread *dequeue_thread(struct cpu *cpu, struct lwkt_thread *skip) {
+static int remove_from_queues(struct lwkt_thread *t) {
+    int removed = 0;
+    for (uint32_t i = 0; i < cpu_online_count(); i++) {
+        struct cpu *c = cpu_by_id(i);
+        if (c && c->online) {
+            removed |= remove_from_cpu_queues(c, t);
+        }
+    }
+    return removed;
+}
+
+/*
+ * Dequeue one runnable thread from cpu's local queues.
+ * Returns NULL if empty (or only skip matches with use_skip_fallback).
+ */
+static struct lwkt_thread *dequeue_from_cpu(struct cpu *cpu, struct lwkt_thread *skip,
+                                          int use_skip_fallback) {
     struct lwkt_thread *fallback = NULL;
 
     for (uint32_t p = 0; p < MAX_PRIORITY; p++) {
-        struct lwkt_thread **slot = &run_queues[p];
+        struct lwkt_thread **slot = &cpu->run_queues[p];
         while (*slot) {
             struct lwkt_thread *t = *slot;
             if (t->state == THREAD_TERMINATED) {
@@ -95,12 +123,57 @@ static struct lwkt_thread *dequeue_thread(struct cpu *cpu, struct lwkt_thread *s
         }
     }
 
-    if (fallback) {
+    if (use_skip_fallback && fallback) {
         remove_from_queues(fallback);
         return fallback;
     }
 
+    return NULL;
+}
+
+static struct lwkt_thread *dequeue_thread(struct cpu *cpu, struct lwkt_thread *skip) {
+    struct lwkt_thread *t = dequeue_from_cpu(cpu, skip, 1);
+    if (t) {
+        return t;
+    }
+
+    /* Work steal: idle CPU pulls from another CPU's queue. */
+    for (uint32_t i = 0; i < cpu_online_count(); i++) {
+        struct cpu *other = cpu_by_id(i);
+        if (!other || !other->online || other == cpu) {
+            continue;
+        }
+        t = dequeue_from_cpu(other, NULL, 0);
+        if (t) {
+            t->run_cpu = cpu->id;
+            return t;
+        }
+    }
+
     return &cpu->idle;
+}
+
+static int cpu_has_runnable(struct cpu *cpu) {
+    if (!cpu) {
+        return 0;
+    }
+    for (uint32_t p = 0; p < MAX_PRIORITY; p++) {
+        if (cpu->run_queues[p]) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void strcpy_local(char *dst, const char *src) {
+    while (*src) {
+        *dst++ = *src++;
+    }
+    *dst = '\0';
+}
+
+static struct cpu *this_cpu(void) {
+    return cpu_current();
 }
 
 static void init_thread_stack(struct lwkt_thread *t) {
@@ -196,8 +269,9 @@ static void worker_entry(void *arg) {
 }
 
 static int has_runnable_threads(void) {
-    for (uint32_t p = 0; p < MAX_PRIORITY; p++) {
-        if (run_queues[p]) {
+    for (uint32_t i = 0; i < cpu_online_count(); i++) {
+        struct cpu *c = cpu_by_id(i);
+        if (c && c->online && cpu_has_runnable(c)) {
             return 1;
         }
     }
@@ -241,27 +315,28 @@ void lwkt_cpu_init_idle(void) {
     idle->entry_point = idle_worker;
     idle->arg = NULL;
     idle->next = NULL;
+    idle->run_cpu = cpu->id;
     idle->yields = 0;
     idle->saved_kernel_rsp = 0;
     idle->mbox_slot = 0;
     idle->wait_next = NULL;
+    idle->mbox_wait_next = NULL;
     idle->uthread = NULL;
     idle->user_cr3 = 0;
     init_thread_stack(idle);
+    cpu_run_queues_init(cpu);
     cpu->current = idle;
 }
 
 void lwkt_init(void) {
     spin_init(&sched_lock);
-    for (int i = 0; i < MAX_PRIORITY; i++) {
-        run_queues[i] = NULL;
-    }
     for (int i = 0; i < MAX_THREADS; i++) {
         thread_pool[i].id = 0;
         thread_pool[i].state = THREAD_TERMINATED;
     }
 
     lwkt_cpu_init_idle();
+    cpu_run_queues_init(this_cpu());
     thread_count = 0;
     sched_active = 0;
 
@@ -349,11 +424,13 @@ struct lwkt_thread *lwkt_create(const char *name, void (*entry)(void *), void *a
     t->arg = arg;
     t->uthread = NULL;
     t->next = NULL;
+    t->run_cpu = 0;
     t->user_cr3 = 0;
     t->pending_cr3_destroy = 0;
     t->yields = 0;
     t->saved_kernel_rsp = 0;
     t->wait_next = NULL;
+    t->mbox_wait_next = NULL;
     t->mbox_slot = (uint8_t)((t - thread_pool) + 1);
     init_thread_stack(t);
     enqueue_thread(t);
@@ -391,6 +468,7 @@ int lwkt_destroy(uint32_t id) {
 
     struct cpu *cpu = this_cpu();
     if (t != (cpu ? cpu->current : NULL)) {
+        msgport_unregister_id(t->id);
         t->rsp = 0;
         t->id = 0;
         thread_count--;
@@ -462,12 +540,18 @@ void lwkt_list(void) {
 
     uint64_t irqf;
     sched_lock_irqsave(&irqf);
-    for (int p = 0; p < MAX_PRIORITY; p++) {
-        for (struct lwkt_thread *t = run_queues[p]; t; t = t->next) {
-            if (t == current || t->state == THREAD_TERMINATED) {
-                continue;
+    for (uint32_t ci = 0; ci < cpu_online_count(); ci++) {
+        struct cpu *c = cpu_by_id(ci);
+        if (!c || !c->online) {
+            continue;
+        }
+        for (int p = 0; p < MAX_PRIORITY; p++) {
+            for (struct lwkt_thread *t = c->run_queues[p]; t; t = t->next) {
+                if (t == current || t->state == THREAD_TERMINATED) {
+                    continue;
+                }
+                print_thread_row(t, 0);
             }
-            print_thread_row(t, 0);
         }
     }
 
@@ -568,10 +652,19 @@ void lwkt_preempt_check(void) {
     if (!spin_trylock(&sched_lock)) {
         return;
     }
-    for (uint32_t p = 0; p < MAX_PRIORITY; p++) {
-        for (struct lwkt_thread *t = run_queues[p]; t; t = t->next) {
-            if (t != cur && t->state != THREAD_TERMINATED) {
-                other = 1;
+    for (uint32_t ci = 0; ci < cpu_online_count(); ci++) {
+        struct cpu *c = cpu_by_id(ci);
+        if (!c || !c->online) {
+            continue;
+        }
+        for (uint32_t p = 0; p < MAX_PRIORITY; p++) {
+            for (struct lwkt_thread *t = c->run_queues[p]; t; t = t->next) {
+                if (t != cur && t->state != THREAD_TERMINATED) {
+                    other = 1;
+                    break;
+                }
+            }
+            if (other) {
                 break;
             }
         }
@@ -636,6 +729,20 @@ void lwkt_switch(void) {
         vmm_aspace_destroy(destroy_cr3);
     }
 
+    /*
+     * If we are on the interrupt/syscall stack (outside the LWKT stack array),
+     * do not let switch_context overwrite prev->rsp with that pointer.
+     */
+    if (prev && prev->uthread) {
+        uint64_t hw_rsp;
+        uint64_t lo = (uint64_t)(uintptr_t)prev->stack;
+        uint64_t hi = lo + STACK_SIZE;
+        __asm__ volatile("mov %%rsp, %0" : "=r"(hw_rsp));
+        if (hw_rsp < lo || hw_rsp >= hi) {
+            __asm__ volatile("mov %0, %%rsp" :: "r"(prev->rsp) : "memory");
+        }
+    }
+
     cpu->switches++;
     switch_context(&prev->rsp, next->rsp);
     cpu_irq_restore(irqf);
@@ -675,6 +782,7 @@ void lwkt_thread_exit(void) {
         remove_from_queues(cpu->current);
         sched_unlock_irqrestore(irqf);
         msgport_clear_slot(cpu->current->mbox_slot);
+        msgport_unregister_id(cpu->current->id);
         cpu->current->state = THREAD_TERMINATED;
         cpu->current->entry_point = NULL;
         cpu->current->id = 0;

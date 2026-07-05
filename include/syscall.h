@@ -23,6 +23,9 @@
 #define SYS_MUTEX_LOCK MYOS_SYS_MUTEX_LOCK
 #define SYS_MUTEX_UNLOCK MYOS_SYS_MUTEX_UNLOCK
 #define SYS_CPUS       MYOS_SYS_CPUS
+#define SYS_MSG_SEND_NAME MYOS_SYS_MSG_SEND_NAME
+#define SYS_PORT_LOOKUP   MYOS_SYS_PORT_LOOKUP
+#define SYS_MSG_PORTS     MYOS_SYS_MSG_PORTS
 
 void syscall_init(void);
 uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3);

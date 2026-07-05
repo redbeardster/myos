@@ -64,6 +64,19 @@ static inline long myos_msg_send(long to_id, const void *buf, unsigned long len)
     return myos_syscall4(MYOS_SYS_MSG_SEND, to_id, (long)(uintptr_t)buf, (long)len, 0);
 }
 
+static inline long myos_msg_send_name(const char *port, const void *buf, unsigned long len) {
+    return myos_syscall4(MYOS_SYS_MSG_SEND_NAME, (long)(uintptr_t)port,
+                         (long)(uintptr_t)buf, (long)len, 0);
+}
+
+static inline long myos_port_lookup(const char *name) {
+    return myos_syscall4(MYOS_SYS_PORT_LOOKUP, (long)(uintptr_t)name, 0, 0, 0);
+}
+
+static inline long myos_msg_ports(void) {
+    return myos_syscall4(MYOS_SYS_MSG_PORTS, 0, 0, 0, 0);
+}
+
 static inline long myos_msg_ping(void) {
     return myos_syscall4(MYOS_SYS_MSG_PING, 0, 0, 0, 0);
 }
