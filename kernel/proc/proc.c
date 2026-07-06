@@ -70,6 +70,9 @@ static void proc_reset_slot(struct proc *p) {
     p->uthread_count = 0;
     p->threads = NULL;
     p->main_thread = NULL;
+    p->runner = NULL;
+    p->current_uthread = NULL;
+    p->run_queue = NULL;
     proc_mutex_init_all(p->mutexes, PROC_MUTEX_MAX);
 }
 
@@ -111,10 +114,16 @@ struct proc *proc_create(const char *name, uint64_t cr3, uint64_t entry,
 
 struct proc *proc_current(void) {
     struct lwkt_thread *t = lwkt_curthread();
-    if (!t || !t->uthread) {
+    if (!t) {
         return NULL;
     }
-    return t->uthread->proc;
+    if (t->user_proc) {
+        return t->user_proc;
+    }
+    if (t->uthread) {
+        return t->uthread->proc;
+    }
+    return NULL;
 }
 
 int proc_is_shell(struct proc *p) {
@@ -207,6 +216,17 @@ void proc_destroy(struct proc *p) {
 
     spin_lock(&proc_table_lock);
 
+    if (p->runner && p->runner->id) {
+        struct lwkt_thread *cur = lwkt_curthread();
+        uint32_t rid = p->runner->id;
+        p->runner = NULL;
+        spin_unlock(&proc_table_lock);
+        if (cur != lwkt_find(rid)) {
+            lwkt_destroy(rid);
+        }
+        spin_lock(&proc_table_lock);
+    }
+
     if (p->cr3) {
         uint64_t cr3 = p->cr3;
         p->cr3 = 0;
@@ -247,10 +267,17 @@ int proc_kill(uint32_t pid) {
     uint32_t ids[MAX_THREADS];
     int n = 0;
     for (struct uthread *u = p->threads; u && n < MAX_THREADS; u = u->next_in_proc) {
-        ids[n++] = u->lwkt_id;
+        if (u->uthread_id) {
+            ids[n++] = u->uthread_id;
+        }
     }
     for (int i = 0; i < n; i++) {
         uthread_kill(ids[i]);
+    }
+
+    if (p->runner && p->runner->id) {
+        lwkt_destroy(p->runner->id);
+        p->runner = NULL;
     }
 
     if (p->pid != 0) {

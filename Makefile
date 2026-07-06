@@ -103,7 +103,7 @@ $(BUILD)/myos.iso: $(BUILD)/kernel.elf $(USER_ELFS) limine.conf
 	rm -rf $(BUILD)/iso_root
 
 run: $(BUILD)/myos.iso
-	qemu-system-x86_64 -M q35 -m 256M -smp 2 -cdrom $(BUILD)/myos.iso -boot d -serial stdio
+	qemu-system-x86_64 -M q35 -m 256M -smp 8 -cdrom $(BUILD)/myos.iso -boot d -serial stdio
 
 clean:
 	rm -rf $(BUILD)

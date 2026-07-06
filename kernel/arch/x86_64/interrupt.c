@@ -222,14 +222,18 @@ void interrupt_handler(uint64_t int_no, uint64_t err_code) {
         timer_switch_count++;
         lwkt_preempt_request();
         lapic_eoi();
-        lwkt_preempt_check();
+        if (!lwkt_in_usersyscall()) {
+            lwkt_preempt_check();
+        }
         return;
     }
 
     if (int_no == LAPIC_IPI_RESCHED_VECTOR) {
         lwkt_preempt_request();
         lapic_eoi();
-        lwkt_preempt_check();
+        if (!lwkt_in_usersyscall()) {
+            lwkt_preempt_check();
+        }
         return;
     }
 
@@ -243,7 +247,7 @@ void interrupt_handler(uint64_t int_no, uint64_t err_code) {
         }
 
         pic_eoi(irq);
-        if (irq == IRQ_TIMER) {
+        if (irq == IRQ_TIMER && !lwkt_in_usersyscall()) {
             lwkt_preempt_check();
         }
         return;

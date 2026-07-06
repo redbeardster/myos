@@ -26,12 +26,15 @@
                             ▼
 ┌─────────────────────────────────────────────────────────────┐
 │  LWKT (lwkt.c) — планировщик, context switch                │
-│  uthread.c   — связка LWKT ↔ процесс ↔ user entry           │
+│  uthread.c   — proc-runner, in-proc sched, user entry       │
 │  msgport.c   — сообщения только между потоками ядра         │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 **Загрузка:** Limine → `kernel/main.c` → `exec_start_shell()` → `lwkt_bootstrap_first()`.
+
+**Proc-runner (фаза 7):** один LWKT-runner на user-процесс, uthread планируются внутри proc.
+Подробно: [PROC_RUNNER.md](PROC_RUNNER.md).
 
 ### Структура каталогов
 
@@ -155,19 +158,21 @@ Syscall / interrupt (TSS.RSP0)
 ```
 exec_spawn_elf()
   → proc_create(cr3, …)
-  → uthread_spawn_in_proc()
-  → lwkt_create() + enqueue
+  → uthread_spawn_in_proc()     # uthread в run_queue proc
+  → proc_start_runner()         # LWKT pN, proc_runner_entry
 
 user: SYS_EXIT
   → uthread_exit()
   → uthread_cleanup() → proc_on_uthread_exit() → proc_destroy (при последнем uthread)
-  → lwkt_thread_exit() → lwkt_yield()   // без возврата в userland
+  → runner LWKT: lwkt_thread_exit() → lwkt_yield()
 ```
 
 Инварианты:
 
 - `SYS_EXIT` не возвращается в syscall stub (`__builtin_unreachable`).
-- `SYS_READ` блокируется через `lwkt_block()` на **syscall stack**, не через jump на user stack.
+- Syscall выполняется на **kernel stack runner LWKT**; из syscall **нельзя** `lwkt_switch()` —
+  см. `in_syscall`, `lwkt_syscall_wait_edge()` в [PROC_RUNNER.md](PROC_RUNNER.md) §4.
+- `SYS_READ` в user proc: poll клавиатуры + `lwkt_syscall_wait_edge()`, не msgport block.
 - После exit LWKT-слот: `id = 0`, `msgport_clear_slot()` в `lwkt_thread_exit()`.
 - Shell (`EXEC_FLAG_SHELL`, `proc->is_shell`) не убивается через `proc_kill_children()`.
 
@@ -175,7 +180,8 @@ user: SYS_EXIT
 
 - Один proc — несколько uthread; у каждого свой user stack (`user_stack_alloc`).
 - `SYS_THREAD_CREATE` / `JOIN` / mutex — см. [THREADS_DEMO.md](THREADS_DEMO.md).
-- **Планировщик uthread нет** — каждый uthread привязан к LWKT; вытеснение = вытеснение LWKT.
+- **In-proc scheduler** (`proc_sched_pick`, `run_queue`); runner — один LWKT на proc.
+- `uthread_yield` из syscall переключает uthread внутри proc; при отсутствии peer — `hlt`.
 
 ### Вытесняющая многозадачность (LWKT)
 
@@ -184,13 +190,15 @@ user: SYS_EXIT
 | PIT IRQ ~100 Hz | `interrupt.c` | `lwkt_preempt_request()` → `lwkt_preempt_check()` после EOI |
 | Выход из syscall | `syscall.c` | `lwkt_preempt_check()` в конце `syscall_dispatch` |
 | `SYS_YIELD` | `lwkt.c` | немедленный `lwkt_switch()` (кооперативно) |
-| `lwkt_block` | `lwkt.c` | блокировка (mutex, join, read, msg) |
+| `lwkt_block` | `lwkt.c` | блокировка kernel LWKT; в syscall runner → `lwkt_syscall_wait_edge()` |
+| `uthread_yield` | `uthread.c` | переключение uthread внутри proc из syscall |
 
-Ограничения unicore:
+Ограничения:
 
 - Preempt только в точках вызова `lwkt_preempt_check` (не произвольная инструкция внутри длинного syscall handler).
-- 16 уровней приоритета; нет fair time slice per thread.
-- SMP: потребуются per-CPU run queue, IPI, spinlock везде (частично готово — `spinlock.h`, `proc_mutex.c`, `memory.c`).
+- Preempt **не** из IRQ во время syscall runner (`in_syscall`).
+- 16 уровней приоритета LWKT; in-proc uthread — поле `priority`.
+- SMP: per-CPU run queue, work steal, idle `hlt` при пустой **локальной** очереди — см. [PROC_RUNNER.md](PROC_RUNNER.md) §5.
 
 ---
 
@@ -199,16 +207,19 @@ user: SYS_EXIT
 | Syscall | Поведение |
 |---------|-----------|
 | `SYS_WRITE`, `SYS_PS`, `SYS_THREADS`, `SYS_ALLOC`, `SYS_FREE`, `SYS_EXEC` | Обработать и вернуться через `iretq` |
-| `SYS_READ` | `keyboard_set_reader` → `lwkt_block()` (цикл на syscall stack) |
-| `SYS_YIELD` | `lwkt_yield()` на syscall stack |
+| `SYS_READ` | user proc: `kbdd_request_char` (poll + `lwkt_syscall_wait_edge`) |
+| `SYS_YIELD` | user proc: `uthread_yield()`; kernel LWKT: `lwkt_yield()` |
 | `SYS_EXIT` | `uthread_exit()` — без return |
-| `SYS_MSG_*` | Как READ/WRITE; при block — `lwkt_block()` внутри msgport |
+| `SYS_THREAD_*`, `SYS_MUTEX_*` | in-proc yield + `MYOS_ERR_AGAIN`; userland цикл в `myos.h` |
+| `SYS_MSG_*` | kernel LWKT: `lwkt_block()`; runner в syscall — см. [PROC_RUNNER.md](PROC_RUNNER.md) §8 |
 
 **Запрещено:**
 
+- `lwkt_switch()` / `lwkt_block()` → switch из syscall runner (`in_syscall`).
 - `syscall_return` / произвольные переходы между user stack и kernel stack.
 - Двойной вызов post-syscall логики после `SYS_EXIT` или `SYS_READ`.
 - Прямой `vmm_switch()` в syscall без учёта того, какой поток станет текущим.
+- Оставлять uthread в `RUNNING` после enqueue (ломает in-proc sched → 100% CPU).
 
 ---
 
@@ -248,7 +259,7 @@ user: SYS_EXIT
 | `kernel/arch/x86_64/isr.asm` | `int 0x80`, `user_enter_asm`, `switch_context` |
 | `kernel/syscall/syscall.c` | Dispatch и copy_from_user |
 | `kernel/sched/lwkt.c` | Планировщик, CR3, TSS, deferred CR3 destroy, **preempt** |
-| `kernel/sched/uthread.c` | User/kernel uthread, trampoline |
+| `kernel/sched/uthread.c` | proc-runner, in-proc sched, trampoline |
 | `kernel/proc/proc.c` | Таблица процессов, destroy, kill |
 | `kernel/mm/vmm.c` | Aspace, map/unmap, active CR3 checks |
 | `kernel/proc/exec.c` / `kernel/proc/elf.c` | Загрузка ELF в aspace процесса |
@@ -268,6 +279,8 @@ user: SYS_EXIT
 - [ ] Shell остаётся с тем же CR3 в `ps` до и после дочернего процесса.
 - [ ] `read` / prompt: ввод команды после exit дочернего работает.
 - [ ] (При изменении msgport) слоты mbox очищаются в `lwkt_thread_exit` / `lwkt_destroy`.
+- [ ] `make run SMP=8` — в простое на `MyOS>` нагрузка QEMU ~0–10% (не 8×90%).
+- [ ] `exec threads.elf` — counter=10, shell жив; см. [PROC_RUNNER.md](PROC_RUNNER.md) §7.
 
 Команды в shell:
 
@@ -304,7 +317,7 @@ if (t && t->uthread && t->uthread->type == UTHREAD_USER) {
 При добавлении `fork`, `wait`, файловой системы, сети:
 
 - Сохранять разделение: user trap → syscall → (опционально) lwkt message внутри ядра.
-- Новые блокирующие syscall — по образцу `SYS_READ` (`lwkt_block` на syscall stack).
+- Новые блокирующие syscall — по образцу `SYS_READ` / proc-runner ([PROC_RUNNER.md](PROC_RUNNER.md) §4).
 - Любое копирование из user VA — с активным CR3 **того процесса**, который вызвал syscall
   (`proc_current()->cr3` уже выбран через `lwkt_apply_cr3`).
 - Для SMP: см. [SMP.md](SMP.md) — AP boot, per-CPU TSS/GS, LAPIC timer, `sched_lock`.
@@ -312,4 +325,4 @@ if (t && t->uthread && t->uthread->type == UTHREAD_USER) {
 
 ---
 
-*Последнее обновление: контекст после исправления TSS.RSP0 и deferred CR3 destroy.*
+*Последнее обновление: proc-runner (фаза 7), SMP idle fix, syscall invariants — см. [PROC_RUNNER.md](PROC_RUNNER.md).*

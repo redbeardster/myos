@@ -163,8 +163,27 @@ static int cpu_has_runnable(struct cpu *cpu) {
         return 0;
     }
     for (uint32_t p = 0; p < MAX_PRIORITY; p++) {
-        if (cpu->run_queues[p]) {
-            return 1;
+        for (struct lwkt_thread *t = cpu->run_queues[p]; t; t = t->next) {
+            if (t->state == THREAD_READY) {
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+static int cpu_has_ready_excluding_idle(struct cpu *cpu) {
+    if (!cpu) {
+        return 0;
+    }
+    for (uint32_t p = 0; p < MAX_PRIORITY; p++) {
+        for (struct lwkt_thread *t = cpu->run_queues[p]; t; t = t->next) {
+            if (t == &cpu->idle) {
+                continue;
+            }
+            if (t->state == THREAD_READY) {
+                return 1;
+            }
         }
     }
     return 0;
@@ -218,7 +237,12 @@ static const char *state_name(enum thread_state state) {
 }
 
 static void print_uthread_cols(struct lwkt_thread *t) {
-    struct uthread *u = t ? t->uthread : NULL;
+    struct uthread *u = NULL;
+    if (t && t->user_proc) {
+        u = t->user_proc->current_uthread;
+    } else if (t) {
+        u = t->uthread;
+    }
     if (!u) {
         console_writestring("  -   -  ");
         return;
@@ -272,24 +296,16 @@ static void worker_entry(void *arg) {
     lwkt_thread_exit();
 }
 
-static int has_runnable_threads(void) {
-    for (uint32_t i = 0; i < cpu_online_count(); i++) {
-        struct cpu *c = cpu_by_id(i);
-        if (c && c->online && cpu_has_runnable(c)) {
-            return 1;
-        }
-    }
-    return 0;
-}
-
 static void idle_worker(void *arg) {
     (void)arg;
     for (;;) {
+        struct cpu *cpu = this_cpu();
         lwkt_preempt_check();
-        if (has_runnable_threads()) {
+        if (cpu_has_ready_excluding_idle(cpu)) {
             lwkt_yield();
             continue;
         }
+        cpu->preempt_requested = 0;
         __asm__ volatile("sti; hlt" ::: "memory");
     }
 }
@@ -427,12 +443,15 @@ struct lwkt_thread *lwkt_create(const char *name, void (*entry)(void *), void *a
     t->entry_point = entry;
     t->arg = arg;
     t->uthread = NULL;
+    t->user_proc = NULL;
     t->next = NULL;
     t->run_cpu = 0;
     t->user_cr3 = 0;
     t->pending_cr3_destroy = 0;
     t->yields = 0;
     t->saved_kernel_rsp = 0;
+    t->runner_resume_rsp = 0;
+    t->in_syscall = 0;
     t->wait_next = NULL;
     t->mbox_wait_next = NULL;
     t->mbox_slot = (uint8_t)((t - thread_pool) + 1);
@@ -609,6 +628,15 @@ struct lwkt_thread *lwkt_curthread(void) {
     return cpu ? cpu->current : NULL;
 }
 
+int lwkt_in_usersyscall(void) {
+    struct lwkt_thread *cur = lwkt_curthread();
+    return cur && cur->in_syscall;
+}
+
+void lwkt_syscall_wait_edge(void) {
+    __asm__ volatile("sti; hlt" ::: "memory");
+}
+
 int lwkt_thread_count(void) {
     return thread_count;
 }
@@ -619,11 +647,13 @@ static void lwkt_apply_cr3(struct lwkt_thread *t) {
 }
 
 static void lwkt_apply_tss(struct lwkt_thread *t) {
-    if (!t || !t->uthread || t->uthread->type != UTHREAD_USER) {
+    if (!t) {
         return;
     }
-    uint64_t top = (uint64_t)(uintptr_t)t->stack + STACK_SIZE;
-    tss_set_rsp0(top & ~0xFULL);
+    if (t->user_proc || (t->uthread && t->uthread->type == UTHREAD_USER)) {
+        uint64_t top = (uint64_t)(uintptr_t)t->stack + STACK_SIZE;
+        tss_set_rsp0(top & ~0xFULL);
+    }
 }
 
 void lwkt_bootstrap_first(void) {
@@ -683,6 +713,21 @@ void lwkt_preempt_check(void) {
         return;
     }
 
+    if (lwkt_in_usersyscall()) {
+        return;
+    }
+
+    if (cur->user_proc && cur->user_proc->current_uthread) {
+        uint64_t hw_rsp;
+        uint64_t lo = (uint64_t)(uintptr_t)cur->stack;
+        uint64_t hi = lo + STACK_SIZE;
+        __asm__ volatile("mov %%rsp, %0" : "=r"(hw_rsp));
+        if (hw_rsp < lo || hw_rsp >= hi) {
+            cpu->preempt_requested = 0;
+            return;
+        }
+    }
+
     int other = 0;
     if (!spin_trylock(&sched_lock)) {
         return;
@@ -694,7 +739,7 @@ void lwkt_preempt_check(void) {
         }
         for (uint32_t p = 0; p < MAX_PRIORITY; p++) {
             for (struct lwkt_thread *t = c->run_queues[p]; t; t = t->next) {
-                if (t != cur && t->state != THREAD_TERMINATED) {
+                if (t != cur && t->state == THREAD_READY) {
                     other = 1;
                     break;
                 }
@@ -710,6 +755,7 @@ void lwkt_preempt_check(void) {
     spin_unlock(&sched_lock);
 
     if (!other && cur == &cpu->idle) {
+        cpu->preempt_requested = 0;
         return;
     }
 
@@ -721,6 +767,11 @@ void lwkt_switch(void) {
     struct cpu *cpu = this_cpu();
     struct lwkt_thread *prev = cpu->current;
     uint64_t irqf = cpu_irq_save();
+
+    if (prev && prev->in_syscall) {
+        cpu_irq_restore(irqf);
+        return;
+    }
 
     spin_lock(&sched_lock);
     if (prev && prev->state == THREAD_RUNNING) {
@@ -765,15 +816,16 @@ void lwkt_switch(void) {
     }
 
     /*
-     * If we are on the interrupt/syscall stack (outside the LWKT stack array),
-     * do not let switch_context overwrite prev->rsp with that pointer.
+     * Never save interrupt/syscall stack pointer into prev->rsp.
+     * int 0x80 runs on the LWKT kernel stack (TSS.RSP0), so hw_rsp can
+     * be inside [stack, stack+SIZE) during a syscall — not a switch frame.
      */
-    if (prev && prev->uthread) {
+    if (prev && (prev->uthread || prev->user_proc)) {
         uint64_t hw_rsp;
         uint64_t lo = (uint64_t)(uintptr_t)prev->stack;
         uint64_t hi = lo + STACK_SIZE;
         __asm__ volatile("mov %%rsp, %0" : "=r"(hw_rsp));
-        if (hw_rsp < lo || hw_rsp >= hi) {
+        if (prev->in_syscall || hw_rsp < lo || hw_rsp >= hi) {
             __asm__ volatile("mov %0, %%rsp" :: "r"(prev->rsp) : "memory");
         }
     }
@@ -791,6 +843,14 @@ void lwkt_block(void) {
     struct cpu *cpu = this_cpu();
     struct lwkt_thread *cur = cpu ? cpu->current : NULL;
     if (!cur || cur->state != THREAD_RUNNING) {
+        return;
+    }
+    /*
+     * int 0x80 uses the LWKT kernel stack; lwkt_switch() from syscall
+     * corrupts the saved RSP. Poll with hlt and let the caller retry.
+     */
+    if (lwkt_in_usersyscall()) {
+        lwkt_syscall_wait_edge();
         return;
     }
     cur->state = THREAD_BLOCKED;

@@ -84,6 +84,11 @@ static int sys_exec(const char *name) {
 }
 
 uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3) {
+    struct lwkt_thread *cur = lwkt_curthread();
+    if (cur) {
+        cur->in_syscall = 1;
+    }
+
     uint64_t ret;
 
     switch (num) {
@@ -109,7 +114,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3) {
             break;
 
         case SYS_YIELD:
-            lwkt_yield();
+            uthread_yield();
             ret = 0;
             break;
 
@@ -274,6 +279,9 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3) {
     }
 
     lwkt_preempt_check();
+    if (cur) {
+        cur->in_syscall = 0;
+    }
     return ret;
 }
 

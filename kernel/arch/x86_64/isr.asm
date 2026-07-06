@@ -13,6 +13,7 @@ global isr32, isr33, isr34, isr35, isr36, isr37, isr38, isr39
 global isr40, isr41, isr42, isr43, isr44, isr45, isr46, isr47, isr64, isr65
 global gdt_load, idt_load, switch_context, thread_bootstrap
 global isr128, user_enter_asm, load_tss
+global syscall_frame_user_rip_rsp_get, syscall_frame_user_rdi_get
 
 %macro ISR_NOERR 1
 isr%1:
@@ -167,11 +168,28 @@ syscall_common:
 
 extern syscall_dispatch
 
+; rdi = rip*, rsi = rsp* — user frame below saved GPRs on syscall stack
+global syscall_frame_user_rip_rsp_get
+syscall_frame_user_rip_rsp_get:
+    mov rax, [rsp + 17 * 8]
+    mov [rdi], rax
+    mov rax, [rsp + 20 * 8]
+    mov [rsi], rax
+    ret
+
+; rdi = rdi* — user rdi at syscall entry
+global syscall_frame_user_rdi_get
+syscall_frame_user_rdi_get:
+    mov rax, [rsp + 8 * 8]
+    mov [rdi], rax
+    ret
+
 global user_enter_asm
 
 user_enter_asm:
-    ; rdi = rip, rsi = rsp, rdx = arg, rcx = &saved_kernel_rsp
+    ; rdi = rip, rsi = rsp, rdx = arg, rcx = &saved_kernel_rsp, r8 = user_rax
     mov [rcx], rsp
+    mov r9, r8
     mov r8, rdi
     mov rdi, rdx
     push qword 0x23
@@ -182,6 +200,7 @@ user_enter_asm:
     push rax
     push qword 0x1B
     push r8
+    mov rax, r9
     iretq
 
 global load_tss

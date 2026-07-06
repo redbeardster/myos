@@ -85,12 +85,22 @@ static inline long myos_thread_create(uintptr_t entry, uint64_t arg, long prio) 
     return myos_syscall4(MYOS_SYS_THREAD_CREATE, (long)entry, (long)arg, prio, 0);
 }
 
-static inline long myos_thread_join(long lwkt_id) {
-    return myos_syscall4(MYOS_SYS_THREAD_JOIN, lwkt_id, 0, 0, 0);
+static inline long myos_thread_join(long uthread_id) {
+    for (;;) {
+        long ret = myos_syscall4(MYOS_SYS_THREAD_JOIN, uthread_id, 0, 0, 0);
+        if (ret != MYOS_ERR_AGAIN) {
+            return ret;
+        }
+    }
 }
 
 static inline long myos_mutex_lock(unsigned long id) {
-    return myos_syscall4(MYOS_SYS_MUTEX_LOCK, (long)id, 0, 0, 0);
+    for (;;) {
+        long ret = myos_syscall4(MYOS_SYS_MUTEX_LOCK, (long)id, 0, 0, 0);
+        if (ret != MYOS_ERR_AGAIN) {
+            return ret;
+        }
+    }
 }
 
 static inline long myos_mutex_unlock(unsigned long id) {

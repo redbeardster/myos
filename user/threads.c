@@ -55,7 +55,7 @@ int main(void) {
 
     myos_write_str("threads.elf: spawning 2 workers (mutex 0=data, 1=console)\n");
 
-    /* Returns LWKT id (not uthread slot). t2 has HIGH prio → may run before t1. */
+    /* Returns uthread id (TID). t2 has HIGH prio → may run before t1. */
     long t1 = myos_thread_spawn(worker, 1);
     long t2 = myos_thread_spawn_prio(worker, 2, MYOS_THREAD_PRIO_HIGH);
     if (t1 < 0 || t2 < 0) {

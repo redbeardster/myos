@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 struct uthread;
+struct proc;
 
 #define MAX_THREADS 32
 #define MAX_PRIORITY 16
@@ -29,6 +30,7 @@ struct lwkt_thread {
     void (*entry_point)(void *arg);
     void *arg;
     struct uthread *uthread;
+    struct proc *user_proc;
     struct lwkt_thread *next;
     uint32_t run_cpu;
     uint64_t rsp;
@@ -36,6 +38,8 @@ struct lwkt_thread {
     uint64_t pending_cr3_destroy;
     uint64_t yields;
     uint64_t saved_kernel_rsp;
+    uint64_t runner_resume_rsp;
+    uint8_t in_syscall;
     uint8_t mbox_slot;
     struct lwkt_thread *wait_next;      /* token / proc_mutex wait queues */
     struct lwkt_thread *mbox_wait_next; /* msgport read_waiters only */
@@ -70,5 +74,8 @@ void lwkt_default_worker(void *arg);
 struct lwkt_thread *lwkt_curthread(void);
 int lwkt_thread_count(void);
 void lwkt_bootstrap_first(void);
+
+int lwkt_in_usersyscall(void);
+void lwkt_syscall_wait_edge(void);
 
 #endif

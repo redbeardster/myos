@@ -2,23 +2,49 @@
 
 #include "console.h"
 #include "msgport.h"
+#include "myos_abi.h"
 #include "proc.h"
+#include "proc_mutex.h"
+#include "spinlock.h"
 #include "user.h"
 
 #include <stddef.h>
 #include <stdint.h>
 
 #define MAX_UTHREADS MAX_THREADS
-
-#define MAX_LWKT_IDS 64
+#define MAX_UTHREAD_IDS 256
 
 static struct uthread uthread_pool[MAX_UTHREADS];
-static int join_exit_code[MAX_LWKT_IDS];
-static int join_exit_valid[MAX_LWKT_IDS];
+static int join_exit_code[MAX_UTHREAD_IDS];
+static volatile int join_exit_valid[MAX_UTHREAD_IDS];
+static spinlock_t uthread_join_lock;
+static uint32_t next_global_uthread_id = 1;
+
+extern void syscall_frame_user_rip_rsp_get(uint64_t *rip, uint64_t *rsp);
+extern void syscall_frame_user_rdi_get(uint64_t *rdi);
+
+static int join_take_result(uint32_t uthread_id, int *exit_code_out) {
+    if (uthread_id == 0 || uthread_id >= MAX_UTHREAD_IDS) {
+        return 0;
+    }
+    if (__atomic_load_n(&join_exit_valid[uthread_id], __ATOMIC_ACQUIRE) == 0) {
+        return 0;
+    }
+    if (exit_code_out) {
+        *exit_code_out = join_exit_code[uthread_id];
+    }
+    __atomic_store_n(&join_exit_valid[uthread_id], 0, __ATOMIC_RELEASE);
+    return 1;
+}
 
 static struct uthread *alloc_slot(void) {
+    static int pool_inited;
+    if (!pool_inited) {
+        spin_init(&uthread_join_lock);
+        pool_inited = 1;
+    }
     for (int i = 0; i < MAX_UTHREADS; i++) {
-        if (uthread_pool[i].lwkt == NULL) {
+        if (uthread_pool[i].uthread_id == 0 && uthread_pool[i].state != UTHREAD_ZOMBIE) {
             uthread_pool[i].slot = (uint32_t)i;
             return &uthread_pool[i];
         }
@@ -26,9 +52,12 @@ static struct uthread *alloc_slot(void) {
     return NULL;
 }
 
-static struct uthread *find_by_lwkt_id(uint32_t id) {
+static struct uthread *find_by_id(uint32_t id) {
+    if (id == 0) {
+        return NULL;
+    }
     for (int i = 0; i < MAX_UTHREADS; i++) {
-        if (uthread_pool[i].lwkt && uthread_pool[i].lwkt_id == id) {
+        if (uthread_pool[i].uthread_id == id) {
             return &uthread_pool[i];
         }
     }
@@ -39,12 +68,16 @@ static void uthread_reset_slot(struct uthread *u) {
     if (!u) {
         return;
     }
-    u->lwkt_id = 0;
+    u->uthread_id = 0;
     u->slot = 0;
+    u->state = UTHREAD_RUNNABLE;
+    u->priority = LWKT_PRIO_NORMAL;
     u->entry = NULL;
     u->arg = NULL;
     u->user_rip = 0;
     u->user_rsp = 0;
+    u->user_rdi = 0;
+    u->user_syscall_ret = 0;
     u->user_arg = 0;
     u->user_stack_base = 0;
     u->exit_code = 0;
@@ -52,10 +85,11 @@ static void uthread_reset_slot(struct uthread *u) {
     u->proc = NULL;
     u->lwkt = NULL;
     u->next_in_proc = NULL;
+    u->run_next = NULL;
     u->type = UTHREAD_KERNEL;
 }
 
-static void uthread_cleanup(struct uthread *u) {
+static void uthread_release_resources(struct uthread *u) {
     if (!u) {
         return;
     }
@@ -67,54 +101,258 @@ static void uthread_cleanup(struct uthread *u) {
         u->user_stack_base = 0;
     }
     if (u->type == UTHREAD_USER && u->proc) {
-        struct proc *p = u->proc;
-        proc_on_uthread_exit(p, u);
-        u->proc = NULL;
+        proc_detach_uthread(u->proc, u);
     }
     if (u->lwkt) {
         u->lwkt->uthread = NULL;
         u->lwkt->user_cr3 = 0;
     }
-    uthread_reset_slot(u);
+}
+
+static void uthread_make_zombie(struct uthread *u) {
+    uthread_release_resources(u);
+    u->join_waiter = NULL;
+    u->state = UTHREAD_ZOMBIE;
+    u->lwkt = NULL;
 }
 
 static void uthread_record_join(struct uthread *u) {
-    if (!u || u->lwkt_id == 0 || u->lwkt_id >= MAX_LWKT_IDS) {
+    uint32_t id = u ? u->uthread_id : 0;
+    if (id == 0 || id >= MAX_UTHREAD_IDS) {
         return;
     }
-    join_exit_code[u->lwkt_id] = u->exit_code;
-    join_exit_valid[u->lwkt_id] = 1;
+    if (u) {
+        join_exit_code[id] = u->exit_code;
+    }
+    __atomic_store_n(&join_exit_valid[id], 1, __ATOMIC_RELEASE);
+    lwkt_sched_ipi_others();
+}
+
+static int uthread_join_zombie(struct uthread *u, struct proc *p, int *exit_code_out) {
+    if (!u || u->state != UTHREAD_ZOMBIE || !p || u->proc != p) {
+        return 0;
+    }
+    if (exit_code_out) {
+        *exit_code_out = u->exit_code;
+    }
+    if (u->uthread_id < MAX_UTHREAD_IDS) {
+        __atomic_store_n(&join_exit_valid[u->uthread_id], 0, __ATOMIC_RELEASE);
+    }
+    uthread_reset_slot(u);
+    return 1;
+}
+
+static void proc_sched_enqueue(struct proc *p, struct uthread *u) {
+    if (!p || !u || u->state == UTHREAD_ZOMBIE) {
+        return;
+    }
+    for (struct uthread *w = p->run_queue; w; w = w->run_next) {
+        if (w == u) {
+            return;
+        }
+    }
+    u->run_next = p->run_queue;
+    p->run_queue = u;
+    if (u->state != UTHREAD_ZOMBIE && u->state != UTHREAD_BLOCKED) {
+        u->state = UTHREAD_RUNNABLE;
+    }
+}
+
+static void proc_sched_remove(struct proc *p, struct uthread *u) {
+    if (!p || !u) {
+        return;
+    }
+    struct uthread **slot = &p->run_queue;
+    while (*slot) {
+        if (*slot == u) {
+            *slot = u->run_next;
+            u->run_next = NULL;
+            return;
+        }
+        slot = &(*slot)->run_next;
+    }
 }
 
 static void uthread_wakeup_joiner(struct uthread *u) {
     if (!u || !u->join_waiter) {
         return;
     }
-    struct lwkt_thread *w = u->join_waiter;
+    struct uthread *w = u->join_waiter;
     u->join_waiter = NULL;
-    lwkt_unblock(w);
+    if (w->state == UTHREAD_BLOCKED && w->proc) {
+        w->state = UTHREAD_RUNNABLE;
+        proc_sched_enqueue(w->proc, w);
+        proc_runner_resched(w->proc);
+    }
+}
+
+static struct uthread *proc_sched_pick_other(struct proc *p, struct uthread *skip) {
+    if (!p || !p->run_queue) {
+        return NULL;
+    }
+
+    struct uthread **bestp = NULL;
+    struct uthread *best = NULL;
+    uint32_t best_prio = MAX_PRIORITY;
+
+    for (struct uthread **slot = &p->run_queue; *slot;) {
+        struct uthread *u = *slot;
+        if (u == skip || u->state != UTHREAD_RUNNABLE) {
+            slot = &u->run_next;
+            continue;
+        }
+        if (!best || u->priority < best_prio) {
+            best = u;
+            best_prio = u->priority;
+            bestp = slot;
+        }
+        slot = &u->run_next;
+    }
+
+    if (!best || !bestp) {
+        return NULL;
+    }
+
+    *bestp = best->run_next;
+    best->run_next = NULL;
+    return best;
+}
+
+static struct uthread *proc_sched_pick(struct proc *p) {
+    return proc_sched_pick_other(p, NULL);
+}
+
+void proc_runner_resched(struct proc *p) {
+    if (!p || !p->runner) {
+        return;
+    }
+    if (p->runner->state == THREAD_BLOCKED) {
+        lwkt_unblock(p->runner);
+    }
+    lwkt_sched_ipi_others();
+}
+
+static void uthread_return_to_runner(struct proc *p) {
+    if (!p || !p->runner || p->runner->runner_resume_rsp == 0) {
+        return;
+    }
+    uint64_t rsp = p->runner->runner_resume_rsp;
+    __asm__ volatile("mov %0, %%rsp" : : "r"(rsp) : "memory");
+    __asm__ volatile("ret");
+    __builtin_unreachable();
+}
+
+static void proc_runner_entry(void *arg) {
+    struct proc *p = (struct proc *)arg;
+    if (!p || !p->runner) {
+        lwkt_thread_exit();
+    }
+
+    for (;;) {
+        struct uthread *u = proc_sched_pick(p);
+        if (!u) {
+            lwkt_block();
+            continue;
+        }
+
+        p->current_uthread = u;
+        u->state = UTHREAD_RUNNING;
+        p->runner->user_cr3 = p->cr3;
+
+        if (!u->user_rip || !u->user_rsp) {
+            proc_sched_remove(p, u);
+            p->current_uthread = NULL;
+            continue;
+        }
+
+        __asm__ volatile("mov %%rsp, %0" : "=r"(p->runner->runner_resume_rsp));
+
+        user_enter(u->user_rip, u->user_rsp, u->user_rdi, u->user_syscall_ret,
+                   &p->runner->saved_kernel_rsp);
+
+        p->current_uthread = NULL;
+    }
+}
+
+int proc_start_runner(struct proc *p, uint32_t lwkt_priority) {
+    if (!p || p->runner) {
+        return p && p->runner ? 0 : -1;
+    }
+
+    char name[16];
+    name[0] = 'p';
+    int i = 1;
+    uint32_t pid = p->pid;
+    if (pid >= 10) {
+        name[i++] = '0' + (char)((pid / 10) % 10);
+    }
+    name[i++] = '0' + (char)(pid % 10);
+    name[i] = '\0';
+
+    struct lwkt_thread *t = lwkt_create(name, proc_runner_entry, p, lwkt_priority);
+    if (!t) {
+        return -2;
+    }
+
+    t->user_proc = p;
+    t->user_cr3 = p->cr3;
+    p->runner = t;
+    return 0;
+}
+
+static uint32_t alloc_uthread_id(void) {
+    for (uint32_t n = 0; n < MAX_UTHREAD_IDS; n++) {
+        uint32_t id = next_global_uthread_id++;
+        if (id == 0) {
+            id = next_global_uthread_id++;
+        }
+        if (!find_by_id(id)) {
+            return id;
+        }
+    }
+    return 0;
+}
+
+static struct uthread *uthread_alloc_user(struct proc *p, uint64_t rip, uint64_t rsp,
+                                          uint64_t arg, uint64_t stack_base, uint32_t priority) {
+    if (!p || p->state != PROC_RUNNING || !p->cr3) {
+        return NULL;
+    }
+
+    struct uthread *u = alloc_slot();
+    if (!u) {
+        return NULL;
+    }
+
+    uint32_t id = alloc_uthread_id();
+    if (id == 0) {
+        uthread_reset_slot(u);
+        return NULL;
+    }
+
+    u->uthread_id = id;
+    u->type = UTHREAD_USER;
+    u->state = UTHREAD_RUNNABLE;
+    u->priority = priority;
+    u->proc = p;
+    u->user_rip = rip;
+    u->user_rsp = rsp;
+    u->user_rdi = arg;
+    u->user_arg = arg;
+    u->user_stack_base = stack_base;
+    u->user_syscall_ret = 0;
+
+    proc_attach_uthread(p, u);
+    proc_sched_enqueue(p, u);
+    proc_runner_resched(p);
+    return u;
 }
 
 static void uthread_bind_lwkt(struct uthread *u, struct lwkt_thread *t) {
-    u->lwkt_id = t->id;
+    u->uthread_id = t->id;
     u->lwkt = t;
     t->uthread = u;
-    if (u->type == UTHREAD_USER && u->proc) {
-        t->user_cr3 = u->proc->cr3;
-    } else {
-        t->user_cr3 = 0;
-    }
-}
-
-static void uthread_user_trampoline(void *arg) {
-    struct uthread *u = (struct uthread *)arg;
-    if (!u || !u->lwkt || !u->proc) {
-        uthread_exit();
-        return;
-    }
-
-    user_enter(u->user_rip, u->user_rsp, u->user_arg, &u->lwkt->saved_kernel_rsp);
-    uthread_exit();
+    u->state = UTHREAD_RUNNABLE;
 }
 
 static void uthread_trampoline(void *arg) {
@@ -123,7 +361,6 @@ static void uthread_trampoline(void *arg) {
         uthread_exit();
         return;
     }
-
     u->entry(u->arg);
     uthread_exit();
 }
@@ -137,9 +374,9 @@ struct uthread *uthread_spawn(const char *name, void (*entry)(void *), void *arg
     u->entry = entry ? entry : lwkt_default_worker;
     u->arg = arg;
     u->type = UTHREAD_KERNEL;
+    u->state = UTHREAD_RUNNABLE;
+    u->priority = priority;
     u->proc = NULL;
-    u->user_rip = 0;
-    u->user_rsp = 0;
 
     struct lwkt_thread *t = lwkt_create(name, uthread_trampoline, u, priority);
     if (!t) {
@@ -153,52 +390,7 @@ struct uthread *uthread_spawn(const char *name, void (*entry)(void *), void *arg
 
 struct uthread *uthread_spawn_in_proc(struct proc *p, uint64_t rip, uint64_t rsp,
                                       uint64_t arg, uint64_t stack_base, uint32_t priority) {
-    if (!p || p->state != PROC_RUNNING || !p->cr3) {
-        return NULL;
-    }
-
-    struct uthread *u = alloc_slot();
-    if (!u) {
-        return NULL;
-    }
-
-    u->entry = NULL;
-    u->arg = NULL;
-    u->type = UTHREAD_USER;
-    u->proc = p;
-    u->user_rip = rip;
-    u->user_rsp = rsp;
-    u->user_arg = arg;
-    u->user_stack_base = stack_base;
-
-    char tname[32];
-    tname[0] = 'u';
-    int i = 1;
-    uint32_t pid = p->pid;
-    if (pid >= 10) {
-        tname[i++] = '0' + (char)((pid / 10) % 10);
-    }
-    tname[i++] = '0' + (char)(pid % 10);
-    if (p->uthread_count > 0) {
-        uint32_t tn = p->uthread_count + 1;
-        tname[i++] = '.';
-        if (tn >= 10) {
-            tname[i++] = '0' + (char)((tn / 10) % 10);
-        }
-        tname[i++] = '0' + (char)(tn % 10);
-    }
-    tname[i] = '\0';
-
-    struct lwkt_thread *t = lwkt_create(tname, uthread_user_trampoline, u, priority);
-    if (!t) {
-        u->proc = NULL;
-        uthread_reset_slot(u);
-        return NULL;
-    }
-
-    uthread_bind_lwkt(u, t);
-    proc_attach_uthread(p, u);
-    return u;
+    return uthread_alloc_user(p, rip, rsp, arg, stack_base, priority);
 }
 
 int uthread_create_in_proc(struct proc *p, uint64_t rip, uint64_t arg, uint32_t priority) {
@@ -211,17 +403,17 @@ int uthread_create_in_proc(struct proc *p, uint64_t rip, uint64_t arg, uint32_t 
         return -2;
     }
 
-    struct uthread *u = uthread_spawn_in_proc(p, rip, rsp, arg, base, priority);
+    struct uthread *u = uthread_alloc_user(p, rip, rsp, arg, base, priority);
     if (!u) {
         user_stack_free(p, base);
         return -3;
     }
 
-    return (int)u->lwkt_id;
+    return (int)u->uthread_id;
 }
 
-int uthread_kill(uint32_t lwkt_id) {
-    struct uthread *u = find_by_lwkt_id(lwkt_id);
+int uthread_kill(uint32_t uthread_id) {
+    struct uthread *u = find_by_id(uthread_id);
     if (!u) {
         return -1;
     }
@@ -230,90 +422,197 @@ int uthread_kill(uint32_t lwkt_id) {
         return -2;
     }
 
-    int rc = lwkt_destroy(lwkt_id);
-    if (rc == 0) {
-        uthread_cleanup(u);
-    }
-    return rc;
-}
-
-struct uthread *uthread_lookup(uint32_t lwkt_id) {
-    return find_by_lwkt_id(lwkt_id);
-}
-
-struct uthread *uthread_current(void) {
-    struct lwkt_thread *t = lwkt_curthread();
-    return t ? t->uthread : NULL;
-}
-
-void uthread_exit(void) {
-    struct lwkt_thread *cur = lwkt_curthread();
-    if (!cur) {
-        return;
+    if (u->type == UTHREAD_KERNEL && u->lwkt) {
+        int rc = lwkt_destroy(u->lwkt->id);
+        if (rc == 0) {
+            uthread_reset_slot(u);
+        }
+        return rc;
     }
 
-    struct uthread *u = cur->uthread;
-    if (u) {
-        uthread_record_join(u);
-        uthread_wakeup_joiner(u);
-        uthread_cleanup(u);
-    }
-
-    lwkt_thread_exit();
-}
-
-int uthread_join(uint32_t lwkt_id, int *exit_code_out) {
-    struct proc *p = proc_current();
-    if (!p || lwkt_id == 0) {
+    if (!u->proc) {
         return -1;
     }
 
-    if (lwkt_id < MAX_LWKT_IDS && join_exit_valid[lwkt_id]) {
-        if (exit_code_out) {
-            *exit_code_out = join_exit_code[lwkt_id];
+    u->exit_code = -1;
+    uthread_record_join(u);
+    uthread_make_zombie(u);
+    uthread_wakeup_joiner(u);
+
+    if (u->proc->current_uthread == u) {
+        uthread_return_to_runner(u->proc);
+    }
+    uthread_reset_slot(u);
+    return 0;
+}
+
+struct uthread *uthread_lookup(uint32_t uthread_id) {
+    return find_by_id(uthread_id);
+}
+
+struct uthread *uthread_current(void) {
+    struct proc *p = proc_current();
+    return p ? p->current_uthread : NULL;
+}
+
+static void uthread_save_syscall_frame(struct uthread *u) {
+    uint64_t rip = 0;
+    uint64_t rsp = 0;
+    uint64_t rdi = 0;
+    syscall_frame_user_rip_rsp_get(&rip, &rsp);
+    syscall_frame_user_rdi_get(&rdi);
+    if (rip) {
+        u->user_rip = rip;
+    }
+    if (rsp) {
+        u->user_rsp = rsp;
+    }
+    u->user_rdi = rdi;
+}
+
+void uthread_yield(void) {
+    struct proc *p = proc_current();
+    struct lwkt_thread *runner = p ? p->runner : NULL;
+    struct uthread *cur = p ? p->current_uthread : NULL;
+
+    if (!p || !runner || !cur) {
+        lwkt_preempt_request();
+        return;
+    }
+
+    if (!lwkt_in_usersyscall()) {
+        lwkt_preempt_request();
+        return;
+    }
+
+    uthread_save_syscall_frame(cur);
+
+    if (cur->state != UTHREAD_BLOCKED) {
+        proc_sched_enqueue(p, cur);
+    }
+
+    struct uthread *next = proc_sched_pick_other(p, cur);
+    if (!next) {
+        if (lwkt_in_usersyscall()) {
+            lwkt_syscall_wait_edge();
         }
-        join_exit_valid[lwkt_id] = 0;
-        return 0;
+        return;
     }
 
-    struct uthread *u = find_by_lwkt_id(lwkt_id);
-    if (!u || u->proc != p) {
-        return -2;
+    runner->in_syscall = 0;
+    uthread_return_to_runner(p);
+}
+
+void uthread_exit(void) {
+    struct proc *p = proc_current();
+    struct uthread *u = uthread_current();
+
+    if (!u) {
+        struct lwkt_thread *cur = lwkt_curthread();
+        if (cur && cur->uthread) {
+            u = cur->uthread;
+            p = u->proc;
+        }
     }
 
-    struct lwkt_thread *self = lwkt_curthread();
-    while (u && u->lwkt && u->lwkt->state != THREAD_TERMINATED) {
-        u->join_waiter = self;
-        lwkt_block();
-        u->join_waiter = NULL;
+    if (u && u->proc) {
+        proc_mutex_abandon_all(u->proc->mutexes, PROC_MUTEX_MAX, u);
+    }
 
-        if (lwkt_id < MAX_LWKT_IDS && join_exit_valid[lwkt_id]) {
-            if (exit_code_out) {
-                *exit_code_out = join_exit_code[lwkt_id];
-            }
-            join_exit_valid[lwkt_id] = 0;
+    if (u) {
+        uint64_t jirqf;
+        spin_lock_irqsave(&uthread_join_lock, &jirqf);
+        uthread_record_join(u);
+        uthread_make_zombie(u);
+        spin_unlock_irqrestore(&uthread_join_lock, jirqf);
+        uthread_wakeup_joiner(u);
+    }
+
+    if (!p || !p->runner) {
+        lwkt_thread_exit();
+    }
+
+    int live = 0;
+    for (struct uthread *walk = p->threads; walk; walk = walk->next_in_proc) {
+        if (walk->state != UTHREAD_ZOMBIE) {
+            live++;
+        }
+    }
+
+    if (live == 0) {
+        proc_on_uthread_exit(p, u);
+        lwkt_thread_exit();
+    }
+
+    uthread_return_to_runner(p);
+}
+
+int uthread_join(uint32_t uthread_id, int *exit_code_out) {
+    struct proc *p = proc_current();
+    if (!p || uthread_id == 0) {
+        return -1;
+    }
+
+    for (;;) {
+        uint64_t irqf;
+        struct uthread *u;
+        struct uthread *self = uthread_current();
+
+        spin_lock_irqsave(&uthread_join_lock, &irqf);
+        if (join_take_result(uthread_id, exit_code_out)) {
+            spin_unlock_irqrestore(&uthread_join_lock, irqf);
             return 0;
         }
 
-        u = find_by_lwkt_id(lwkt_id);
-        if (!u) {
-            break;
+        u = find_by_id(uthread_id);
+        if (!u || u->proc != p) {
+            if (join_take_result(uthread_id, exit_code_out)) {
+                spin_unlock_irqrestore(&uthread_join_lock, irqf);
+                return 0;
+            }
+            spin_unlock_irqrestore(&uthread_join_lock, irqf);
+            return MYOS_ERR_NOENT;
+        }
+
+        if (uthread_join_zombie(u, p, exit_code_out)) {
+            spin_unlock_irqrestore(&uthread_join_lock, irqf);
+            return 0;
+        }
+
+        if (u->state == UTHREAD_ZOMBIE) {
+            spin_unlock_irqrestore(&uthread_join_lock, irqf);
+            return MYOS_ERR_NOENT;
+        }
+
+        if (self) {
+            u->join_waiter = self;
+            proc_sched_remove(p, self);
+            self->state = UTHREAD_BLOCKED;
+        }
+        spin_unlock_irqrestore(&uthread_join_lock, irqf);
+
+        uthread_yield();
+        if (lwkt_in_usersyscall()) {
+            if (self) {
+                self->user_syscall_ret = (uint64_t)(int64_t)MYOS_ERR_AGAIN;
+            }
+            lwkt_syscall_wait_edge();
+            return MYOS_ERR_AGAIN;
+        }
+
+        if (self) {
+            spin_lock_irqsave(&uthread_join_lock, &irqf);
+            u = find_by_id(uthread_id);
+            if (u) {
+                u->join_waiter = NULL;
+            }
+            spin_unlock_irqrestore(&uthread_join_lock, irqf);
         }
     }
-
-    if (lwkt_id < MAX_LWKT_IDS && join_exit_valid[lwkt_id]) {
-        if (exit_code_out) {
-            *exit_code_out = join_exit_code[lwkt_id];
-        }
-        join_exit_valid[lwkt_id] = 0;
-        return 0;
-    }
-
-    return -3;
 }
 
 uint32_t uthread_slot_of(const struct uthread *u) {
-    if (!u || !u->lwkt) {
+    if (!u) {
         return (uint32_t)-1;
     }
     return u->slot;
@@ -337,27 +636,24 @@ static const char *uthread_type_name(enum uthread_type type) {
     return type == UTHREAD_USER ? "user" : "kernel";
 }
 
-static const char *lwkt_state_name(struct lwkt_thread *t) {
-    if (!t) {
-        return "-";
-    }
-    switch (t->state) {
-        case THREAD_READY: return "ready";
-        case THREAD_RUNNING: return "running";
-        case THREAD_BLOCKED: return "blocked";
-        case THREAD_TERMINATED: return "dead";
+static const char *uthread_state_name(enum uthread_state st) {
+    switch (st) {
+        case UTHREAD_RUNNABLE: return "ready";
+        case UTHREAD_RUNNING: return "running";
+        case UTHREAD_BLOCKED: return "blocked";
+        case UTHREAD_ZOMBIE: return "zombie";
         default: return "?";
     }
 }
 
 void uthread_list(void) {
-    console_writestring("\nSlot  PID  #InProc  LWKT  Type    LWKT-State  Name\n");
-    console_writestring("----  ---  -------  ----  ------  ----------  ----------\n");
+    console_writestring("\nSlot  PID  #InProc  TID   Type    State       Prio  Name\n");
+    console_writestring("----  ---  -------  ----  ------  ----------  ----  ----------\n");
 
     int count = 0;
     for (int i = 0; i < MAX_UTHREADS; i++) {
         struct uthread *u = &uthread_pool[i];
-        if (!u->lwkt) {
+        if (u->uthread_id == 0 && u->state != UTHREAD_ZOMBIE) {
             continue;
         }
         count++;
@@ -380,11 +676,13 @@ void uthread_list(void) {
         }
         console_writestring("     ");
 
-        console_write_dec(u->lwkt_id);
+        console_write_dec(u->uthread_id);
         console_writestring("  ");
         console_writestring(uthread_type_name(u->type));
         console_writestring("    ");
-        console_writestring(lwkt_state_name(u->lwkt));
+        console_writestring(uthread_state_name(u->state));
+        console_writestring("    ");
+        console_write_dec(u->priority);
         console_writestring("    ");
 
         if (u->proc && u->proc->name[0]) {

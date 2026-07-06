@@ -87,18 +87,16 @@ void user_stack_free(struct proc *p, uint64_t stack_base) {
     }
 }
 
-extern void user_enter_asm(uint64_t rip, uint64_t rsp, uint64_t arg, uint64_t *save_kernel_rsp);
+extern void user_enter_asm(uint64_t rip, uint64_t rsp, uint64_t arg,
+                           uint64_t *save_kernel_rsp, uint64_t user_rax);
 
-void user_enter(uint64_t rip, uint64_t rsp, uint64_t arg, uint64_t *save_kernel_rsp) {
+void user_enter(uint64_t rip, uint64_t rsp, uint64_t arg, uint64_t user_rax,
+                uint64_t *save_kernel_rsp) {
     struct lwkt_thread *t = lwkt_curthread();
     if (t) {
         uint64_t top = (uint64_t)(uintptr_t)t->stack + STACK_SIZE;
         tss_set_rsp0(top & ~0xFULL);
     }
 
-    user_enter_asm(rip, rsp, arg, save_kernel_rsp);
-
-    for (;;) {
-        __asm__ volatile("hlt");
-    }
+    user_enter_asm(rip, rsp, arg, save_kernel_rsp, user_rax);
 }

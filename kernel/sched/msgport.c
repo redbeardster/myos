@@ -501,7 +501,7 @@ int msgd_start(void) {
     if (!u || !u->lwkt) {
         return -1;
     }
-    msgd_lwkt_id = u->lwkt_id;
+    msgd_lwkt_id = u->uthread_id;
     if (msgport_register("msgd", u->lwkt) != 0) {
         console_writestring("msgport_register(msgd) failed\n");
     }

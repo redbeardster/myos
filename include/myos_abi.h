@@ -49,4 +49,7 @@
 #define MYOS_PRIO_NORMAL  8
 #define MYOS_PRIO_LOW     15
 
+#define MYOS_ERR_AGAIN    (-11)
+#define MYOS_ERR_NOENT    (-2)
+
 #endif

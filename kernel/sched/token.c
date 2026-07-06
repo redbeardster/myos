@@ -403,11 +403,12 @@ void token_shared_mp_selftest_start(void) {
 
 static void selftest_checker(void *arg) {
     (void)arg;
-    for (int spin = 0; spin < 500000; spin++) {
+    for (;;) {
         if (selftest_workers_done >= 3) {
             break;
         }
-        lwkt_yield();
+        lwkt_preempt_request();
+        __asm__ volatile("sti; hlt" ::: "memory");
     }
 
     if (selftest_workers_done >= 3 && selftest_counter == 10 &&

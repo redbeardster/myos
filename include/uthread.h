@@ -9,34 +9,47 @@ enum uthread_type {
     UTHREAD_USER = 1
 };
 
+enum uthread_state {
+    UTHREAD_RUNNABLE = 0,
+    UTHREAD_RUNNING = 1,
+    UTHREAD_BLOCKED = 2,
+    UTHREAD_ZOMBIE = 3
+};
+
 struct proc;
 
 struct uthread {
     uint32_t slot;
-    uint32_t lwkt_id;
+    uint32_t uthread_id;
     enum uthread_type type;
+    enum uthread_state state;
+    uint32_t priority;
     void (*entry)(void *);
     void *arg;
     uint64_t user_rip;
     uint64_t user_rsp;
+    uint64_t user_rdi;
+    uint64_t user_syscall_ret;
     uint64_t user_arg;
     uint64_t user_stack_base;
     int exit_code;
-    struct lwkt_thread *join_waiter;
+    struct uthread *join_waiter;
     struct proc *proc;
     struct lwkt_thread *lwkt;
     struct uthread *next_in_proc;
+    struct uthread *run_next;
 };
 
 struct uthread *uthread_spawn(const char *name, void (*entry)(void *), void *arg, uint32_t priority);
 struct uthread *uthread_spawn_in_proc(struct proc *p, uint64_t rip, uint64_t rsp,
                                       uint64_t arg, uint64_t stack_base, uint32_t priority);
 int uthread_create_in_proc(struct proc *p, uint64_t rip, uint64_t arg, uint32_t priority);
-int uthread_join(uint32_t lwkt_id, int *exit_code_out);
-int uthread_kill(uint32_t lwkt_id);
-struct uthread *uthread_lookup(uint32_t lwkt_id);
+int uthread_join(uint32_t uthread_id, int *exit_code_out);
+int uthread_kill(uint32_t uthread_id);
+struct uthread *uthread_lookup(uint32_t uthread_id);
 struct uthread *uthread_current(void);
 void uthread_exit(void);
+void uthread_yield(void);
 void uthread_list(void);
 
 uint32_t uthread_slot_of(const struct uthread *u);

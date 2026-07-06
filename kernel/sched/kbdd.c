@@ -196,6 +196,27 @@ int kbdd_request_char(void) {
         return -1;
     }
 
+    /*
+     * From int 0x80 the runner LWKT stays RUNNING across hlt; kbdd never
+     * gets scheduled to handle MSG_KBD_WAIT. Poll the IRQ scancode ring
+     * directly instead of blocking on msgport.
+     */
+    if (lwkt_in_usersyscall()) {
+        for (;;) {
+            kbdd_drain_scancodes();
+
+            char c = 0;
+            token_lock(&kbdd.lock);
+            int ok = char_ring_pop(&c);
+            token_unlock(&kbdd.lock);
+            if (ok) {
+                return (int)(unsigned char)c;
+            }
+
+            lwkt_syscall_wait_edge();
+        }
+    }
+
     if (msg_send_name("kbdd", MSG_TYPE_KBD_WAIT, NULL, 0) != 0) {
         return -1;
     }

@@ -6,57 +6,62 @@
 
 - [USERLAND.md](USERLAND.md) — общий гайд по userland и API
 - [DEVELOPMENT.md](DEVELOPMENT.md) — архитектура ядра, LWKT, инварианты CR3/TSS
+- [PROC_RUNNER.md](PROC_RUNNER.md) — **proc-runner**: 1 LWKT на proc, in-proc sched, фиксы syscall/SMP idle
 
 ---
 
 ## 1. Краткий ответ: есть ли вытеснение uthread?
 
-**Да, но не отдельный планировщик uthread.** User-потоки (uthread) всегда выполняются на **LWKT**-потоке ядра. Вытеснение реализовано на уровне **LWKT**:
+**Да.** User-потоки выполняются на **одном LWKT-runner** на процесс (`pN`). Вытеснение между **процессами** и kernel LWKT — на уровне **LWKT**; между **uthread одного proc** — **in-proc scheduler** (`uthread_yield`, join, mutex).
 
 | Механизм | Где | Что делает |
 |----------|-----|------------|
-| **Вытесняющий** | PIT ~100 Hz (`timer_interrupt_handler`) | `lwkt_preempt_request()` → при выходе из IRQ таймера `lwkt_preempt_check()` → `lwkt_switch()` |
-| **Вытесняющий** | Возврат из любого syscall | `lwkt_preempt_check()` в конце `syscall_dispatch()` |
-| **Вытесняющий** | `SYS_READ` в цикле ожидания клавиатуры | после разблокировки |
-| **Кооперативный** | `SYS_YIELD` / `myos_yield()` | немедленный `lwkt_switch()` |
+| **Вытесняющий** | PIT ~100 Hz (`timer_interrupt_handler`) | `lwkt_preempt_request()` → `lwkt_preempt_check()` (не из IRQ при syscall runner) |
+| **Вытесняющий** | Возврат из syscall | `lwkt_preempt_check()` после `in_syscall=0` |
+| **Кооперативный** | `SYS_YIELD` / `myos_yield()` | `uthread_yield()` — переключение uthread внутри proc |
+| **Блокировка** | `SYS_READ`, join, mutex | `lwkt_syscall_wait_edge()` или in-proc yield + `MYOS_ERR_AGAIN` |
 
-То есть uthread в ring 3 **может быть прерван таймером** между двумя инструкциями user-кода (через IRQ → preempt check). Это не чистая кооперация.
+Preempt **не** прерывает runner посреди syscall (инвариант `in_syscall` — см. [PROC_RUNNER.md](PROC_RUNNER.md) §4).
 
 ### Ограничения текущей модели
 
-- Нет отдельной квантовой нарезки «на uthread» — только общий LWKT scheduler и 16 уровней приоритета.
-- Preempt check только в **известных точках** (IRQ таймера, exit syscall). Длинный участок **внутри одного syscall** в ядре не прерывается таймером, пока не вернётся в userland (кроме путей с явным `lwkt_preempt_check`).
-- Один CPU (unicore); нет IPI-preempt для SMP.
-- `myos_yield()` не обязателен для переключения, но полезен для отдачи CPU без ожидания тика таймера.
+- In-proc квантования нет — fair switch через yield, mutex, join.
+- Preempt runner только между syscall / в user mode (с ограничениями §4 PROC_RUNNER).
+- SMP: per-CPU LWKT queues; idle AP в `hlt` при пустой локальной очереди.
+- `myos_yield()` переключает uthread внутри proc, не отдаёт CPU другому процессу (для этого нужен блокирующий syscall или preempt LWKT).
 
 **Практический вывод для `threads.elf`:** mutex на `counter` нужен именно потому, что другой uthread может быть вытеснен **после** инкремента, но **до** unlock — или наоборот. Без `MYOS_MUTEX_DATA` возможны гонки.
 
 ---
 
-## 2. Три слоя исполнения
+## 2. Три слоя исполнения (proc-runner)
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│  proc (PID, CR3, куча, mutex[8], список uthread)        │
-│    ├─ uthread main    ──► LWKT (планировщик, prio 8)    │
-│    ├─ uthread worker1 ──► LWKT (prio 8)                 │
-│    └─ uthread worker2 ──► LWKT (prio 2 = HIGH)          │
+│  proc (PID, CR3, run_queue, mutex[8], uthread list)    │
+│    ├─ uthread main                                      │
+│    ├─ uthread worker1    ── in-proc sched ──┐           │
+│    └─ uthread worker2                       │           │
+│              ▲                              │           │
+│         proc_sched_pick                     │           │
+│              │                              │           │
+│         LWKT runner p{N}  (один на proc) ◄──┘           │
 └─────────────────────────────────────────────────────────┘
 ```
 
 | Слой | Структура | Роль |
 |------|-----------|------|
-| **proc** | `struct proc` | Контейнер процесса: адресное пространство, куча, mutex'ы |
-| **uthread** | `struct uthread` | Логический поток userland внутри proc |
-| **LWKT** | `struct lwkt_thread` | Единица планировщика: kernel stack, приоритет, состояние |
+| **proc** | `struct proc` | Контейнер: CR3, куча, mutex'ы, `run_queue`, `runner` |
+| **uthread** | `struct uthread` | Логический поток userland; `uthread_id` = TID |
+| **LWKT runner** | `struct lwkt_thread` | Один на proc: kernel stack, `proc_runner_entry` |
 
 Команды shell:
 
 | Команда | Показывает |
 |---------|------------|
 | `ps` | proc (PID, CR3, число uthread) |
-| `uthreads` | uthread (slot, PID, #InProc, LWKT id) |
-| `threads` | LWKT (id, приоритет, состояние, CR3) |
+| `uthreads` | uthread (TID, PID, #InProc, state) |
+| `threads` | LWKT (`p1`, `p2`, … runners + kernel threads) |
 
 ---
 

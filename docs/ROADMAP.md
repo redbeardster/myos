@@ -135,6 +135,38 @@ IRQ keyboard ──► ring buffer (spinlock, коротко)
 
 ---
 
+## Фаза 7 — proc-runner (1 LWKT на user-proc) ✅
+
+**Цель:** in-proc планирование uthread; один LWKT-runner на процесс (DragonFly user scheduling, упрощённо).
+
+| Было | Стало |
+|------|-------|
+| 1 uthread = 1 LWKT (`u1`, `u2.1`) | 1 runner `pN` на proc |
+| `lwkt_yield` из syscall | `uthread_yield` + `return_to_runner` |
+| `THREAD_CREATE` → `lwkt_id` | → `uthread_id` (TID) |
+| `kbdd` через msgport из syscall | poll IRQ ring из syscall |
+| AP idle: global yield storm | local `hlt` + `THREAD_READY` only |
+
+**Полное описание, инварианты syscall/SMP idle, чеклист:** [PROC_RUNNER.md](PROC_RUNNER.md)
+
+**Проверка:**
+
+```text
+make run SMP=8
+# htop: ~0–10% в простое на MyOS>
+help
+exec threads.elf
+threads    # p1, p2 — runners
+uthreads
+cpus
+```
+
+**Файлы:** `include/proc.h`, `include/lwkt.h`, `include/uthread.h`, `kernel/sched/uthread.c`,
+`kernel/proc/exec.c`, `kernel/proc/proc_mutex.c`, `kernel/sched/kbdd.c`, `kernel/sched/lwkt.c`,
+`kernel/syscall/syscall.c`, `user/myos.h`
+
+---
+
 ## Зависимости
 
 ```mermaid
@@ -144,14 +176,18 @@ flowchart LR
     P3[proc_mutex to token]
     P4[msgport names]
     P5[kbdd IPC]
+    P7[proc-runner]
     P1 --> P5
     P2 --> P4
     P3 --> P5
     P4 --> P5
+    P1 --> P7
+    P3 --> P7
 ```
 
 - Фазы **2** и **3** независимы от 1 (можно параллельно).
 - **5** требует **4** (именованный порт `kbdd`) и желательно **1** (SMP-safe scheduling).
+- **7** (proc-runner) требует **1** (SMP) и **3** (proc_mutex/token); см. [PROC_RUNNER.md](PROC_RUNNER.md).
 
 ---
 
@@ -160,4 +196,4 @@ flowchart LR
 - Целые файлы ядра (UVM, buf, vnode, …) — несовместимы с MyOS.
 - Берём **паттерны** и переписываем под наш `lwkt` / `token` / `msgport` (~100–300 строк на примитив).
 
-См. также [TOKEN.md](TOKEN.md), [SMP.md](SMP.md), [DEVELOPMENT.md](DEVELOPMENT.md).
+См. также [TOKEN.md](TOKEN.md), [SMP.md](SMP.md), [PROC_RUNNER.md](PROC_RUNNER.md), [DEVELOPMENT.md](DEVELOPMENT.md).

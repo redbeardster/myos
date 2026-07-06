@@ -6,6 +6,7 @@
 #include "proc_mutex.h"
 
 struct uthread;
+struct lwkt_thread;
 
 enum proc_state {
     PROC_RUNNING = 0,
@@ -25,6 +26,9 @@ struct proc {
     int uthread_count;
     struct uthread *threads;
     struct uthread *main_thread;
+    struct lwkt_thread *runner;
+    struct uthread *current_uthread;
+    struct uthread *run_queue;
     struct proc_mutex mutexes[PROC_MUTEX_MAX];
 };
 
@@ -36,6 +40,8 @@ int proc_is_shell(struct proc *p);
 void proc_attach_uthread(struct proc *p, struct uthread *u);
 void proc_detach_uthread(struct proc *p, struct uthread *u);
 void proc_on_uthread_exit(struct proc *p, struct uthread *u);
+int proc_start_runner(struct proc *p, uint32_t lwkt_priority);
+void proc_runner_resched(struct proc *p);
 void proc_destroy(struct proc *p);
 int proc_kill(uint32_t pid);
 void proc_kill_all(void);
