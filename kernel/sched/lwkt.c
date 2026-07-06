@@ -50,8 +50,13 @@ static void enqueue_on_cpu(struct cpu *cpu, struct lwkt_thread *t) {
     }
 
     struct lwkt_thread *tail = cpu->run_queues[p];
-    while (tail->next) {
+    int guard = 0;
+    while (tail->next && guard < MAX_THREADS) {
         tail = tail->next;
+        guard++;
+    }
+    if (guard >= MAX_THREADS) {
+        tail->next = NULL;
     }
     tail->next = t;
 }
@@ -221,9 +226,8 @@ static void print_uthread_cols(struct lwkt_thread *t) {
     console_writestring("  ");
     console_write_dec(uthread_slot_of(u));
     console_writestring("   ");
-    int pin = uthread_index_in_proc(u);
-    if (pin > 0) {
-        console_write_dec((uint64_t)pin);
+    if (u->proc && u->proc->pid) {
+        console_write_dec(u->proc->pid);
     } else {
         console_putchar('-');
     }
@@ -527,45 +531,76 @@ void lwkt_info(uint32_t id) {
     console_putchar('\n');
 }
 
+#define LWKT_LIST_SNAP_MAX (MAX_THREADS + 8)
+
+struct lwkt_list_snap {
+    struct lwkt_thread *t;
+};
+
+static int lwkt_list_collect(struct lwkt_list_snap *snap, int max,
+                             struct lwkt_thread *current) {
+    int n = 0;
+    uint64_t irqf;
+
+    sched_lock_irqsave(&irqf);
+
+    for (uint32_t ci = 0; ci < cpu_online_count() && n < max; ci++) {
+        struct cpu *c = cpu_by_id(ci);
+        if (!c || !c->online) {
+            continue;
+        }
+        for (int p = 0; p < MAX_PRIORITY && n < max; p++) {
+            int guard = 0;
+            for (struct lwkt_thread *t = c->run_queues[p];
+                 t && n < max && guard < MAX_THREADS;
+                 t = t->next, guard++) {
+                if (t == current || t->state == THREAD_TERMINATED) {
+                    continue;
+                }
+                snap[n++].t = t;
+            }
+        }
+    }
+
+    for (int i = 0; i < MAX_THREADS && n < max; i++) {
+        struct lwkt_thread *t = &thread_pool[i];
+        if (t->id == 0 || t == current || t->state != THREAD_BLOCKED) {
+            continue;
+        }
+        snap[n++].t = t;
+    }
+
+    sched_unlock_irqrestore(irqf);
+    return n;
+}
+
 void lwkt_list(void) {
     struct cpu *cpu = this_cpu();
     struct lwkt_thread *current = cpu ? cpu->current : NULL;
+    struct lwkt_list_snap snap[LWKT_LIST_SNAP_MAX];
+    int snap_n;
+    int total;
+    uint64_t irqf;
 
     console_writestring("\nLWKT  Slot Proc  Name            Prio  State      CPU CR3\n");
     console_writestring("----  ---- ----  --------------  ----  ---------  --- ---------------\n");
+
+    snap_n = lwkt_list_collect(snap, LWKT_LIST_SNAP_MAX, current);
+
+    sched_lock_irqsave(&irqf);
+    total = thread_count;
+    sched_unlock_irqrestore(irqf);
 
     if (current) {
         print_thread_row(current, 1);
     }
 
-    uint64_t irqf;
-    sched_lock_irqsave(&irqf);
-    for (uint32_t ci = 0; ci < cpu_online_count(); ci++) {
-        struct cpu *c = cpu_by_id(ci);
-        if (!c || !c->online) {
-            continue;
-        }
-        for (int p = 0; p < MAX_PRIORITY; p++) {
-            for (struct lwkt_thread *t = c->run_queues[p]; t; t = t->next) {
-                if (t == current || t->state == THREAD_TERMINATED) {
-                    continue;
-                }
-                print_thread_row(t, 0);
-            }
-        }
+    for (int i = 0; i < snap_n; i++) {
+        print_thread_row(snap[i].t, 0);
     }
-
-    for (int i = 0; i < MAX_THREADS; i++) {
-        struct lwkt_thread *t = &thread_pool[i];
-        if (t->id == 0 || t == current || t->state != THREAD_BLOCKED) {
-            continue;
-        }
-        print_thread_row(t, 0);
-    }
-    sched_unlock_irqrestore(irqf);
 
     console_writestring("\nTotal: ");
-    console_write_dec((uint64_t)thread_count + cpu_online_count());
+    console_write_dec((uint64_t)total + cpu_online_count());
     console_writestring(" threads (incl. idle per CPU)\n");
 }
 
