@@ -191,8 +191,7 @@ void console_clear(void) {
     cursor_row = 0;
 }
 
-void console_putchar(char c) {
-    spin_lock(&console_lock);
+static void console_emit_char(char c) {
     unsigned max_cols = fb ? (unsigned)(fb->width / FONT_W) : SCREEN_COLS;
     unsigned max_rows = fb ? (unsigned)(fb->height / CHAR_HEIGHT) : SCREEN_ROWS;
 
@@ -208,13 +207,11 @@ void console_putchar(char c) {
             cursor_col--;
             draw_char(cursor_col, cursor_row, ' ');
         }
-        spin_unlock(&console_lock);
         return;
     } else if (c >= ' ') {
         draw_char(cursor_col, cursor_row, c);
         cursor_col++;
     } else {
-        spin_unlock(&console_lock);
         return;
     }
 
@@ -226,31 +223,55 @@ void console_putchar(char c) {
     if (cursor_row >= max_rows) {
         scroll_up();
     }
+}
+
+void console_putchar(char c) {
+    spin_lock(&console_lock);
+    console_emit_char(c);
+    spin_unlock(&console_lock);
+}
+
+void console_write_n(const char *str, uint64_t len) {
+    if (!str || len == 0) {
+        return;
+    }
+    spin_lock(&console_lock);
+    for (uint64_t i = 0; i < len; i++) {
+        console_emit_char(str[i]);
+    }
     spin_unlock(&console_lock);
 }
 
 void console_writestring(const char *str) {
-    while (str && *str) {
-        console_putchar(*str++);
+    if (!str) {
+        return;
     }
+    spin_lock(&console_lock);
+    while (*str) {
+        console_emit_char(*str++);
+    }
+    spin_unlock(&console_lock);
 }
 
 void console_write_dec(uint64_t n) {
+    char buf[32];
+    int i = 0;
+
     if (n == 0) {
         console_putchar('0');
         return;
     }
 
-    char buf[32];
-    int i = 0;
     while (n > 0) {
         buf[i++] = (char)('0' + (n % 10));
         n /= 10;
     }
 
+    spin_lock(&console_lock);
     while (i > 0) {
-        console_putchar(buf[--i]);
+        console_emit_char(buf[--i]);
     }
+    spin_unlock(&console_lock);
 }
 
 void console_write_hex(uint64_t n) {

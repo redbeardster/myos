@@ -28,14 +28,24 @@ static void syscall_stash_user_callee(struct uthread *u, uint64_t rbx, uint64_t 
     u->user_regs_valid = 1;
 }
 
-static void copy_from_user(char *dst, const char *src, uint64_t len) {
+static int copy_from_user_safe(char *dst, const char *src, uint64_t len) {
+    uint64_t s = (uint64_t)(uintptr_t)src;
+    if (s < MYOS_USER_BASE || s + len > MYOS_USER_STACK_TOP || s + len < s) {
+        return -1;
+    }
     for (uint64_t i = 0; i < len; i++) {
         dst[i] = src[i];
     }
+    return 0;
 }
 
 static int copy_user_string(char *dst, const char *src, uint64_t max) {
     if (!dst || !src || max == 0) {
+        return -1;
+    }
+
+    uint64_t s = (uint64_t)(uintptr_t)src;
+    if (s < MYOS_USER_BASE || s + max > MYOS_USER_STACK_TOP || s + max < s) {
         return -1;
     }
 
@@ -63,10 +73,10 @@ static int sys_write(uint64_t fd, const char *buf, uint64_t len) {
     }
 
     char tmp[256];
-    copy_from_user(tmp, buf, len);
-    for (uint64_t i = 0; i < len; i++) {
-        console_putchar(tmp[i]);
+    if (copy_from_user_safe(tmp, buf, len) != 0) {
+        return -1;
     }
+    console_write_n(tmp, len);
     return (int)len;
 }
 
@@ -173,7 +183,10 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 break;
             }
             if (len > 0) {
-                copy_from_user(tmp, (const char *)(uintptr_t)a2, len);
+                if (copy_from_user_safe(tmp, (const char *)(uintptr_t)a2, len) != 0) {
+                    ret = (uint64_t)-1;
+                    break;
+                }
             }
             ret = (uint64_t)(int64_t)msg_send((uint32_t)a1, MSG_TYPE_DATA, tmp, (uint32_t)len);
             break;
@@ -304,7 +317,10 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 break;
             }
             if (len > 0) {
-                copy_from_user(tmp, (const char *)(uintptr_t)a2, len);
+                if (copy_from_user_safe(tmp, (const char *)(uintptr_t)a2, len) != 0) {
+                    ret = (uint64_t)-1;
+                    break;
+                }
             }
             ret = (uint64_t)(int64_t)msg_send_name(port, MSG_TYPE_DATA, tmp, (uint32_t)len);
             break;
@@ -336,12 +352,17 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
 
 uint64_t syscall_post_dispatch(uint64_t ret) {
     struct lwkt_thread *cur = lwkt_curthread();
-    if (cur && cur->runner_reswitch) {
-        cur->runner_reswitch = 0;
-        cur->in_syscall = 0;
-        runner_longjmp(&cur->runner_jmp, 1);
-    }
     if (cur) {
+        if (cur->pending_kill) {
+            cur->pending_kill = 0;
+            cur->in_syscall = 0;
+            runner_longjmp(&cur->runner_jmp, 1);
+        }
+        if (cur->runner_reswitch) {
+            cur->runner_reswitch = 0;
+            cur->in_syscall = 0;
+            runner_longjmp(&cur->runner_jmp, 1);
+        }
         cur->in_syscall = 0;
     }
     return ret;

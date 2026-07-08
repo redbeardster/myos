@@ -54,6 +54,7 @@ struct lwkt_thread {
     runner_jmp_buf runner_jmp;
     uint8_t in_syscall;
     uint8_t runner_reswitch;
+    uint8_t pending_kill;
     uint8_t mbox_slot;
     struct lwkt_thread *wait_next;      /* token / proc_mutex wait queues */
     struct lwkt_thread *mbox_wait_next; /* msgport read_waiters only */

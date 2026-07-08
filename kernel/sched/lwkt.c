@@ -186,7 +186,9 @@ static int cpu_has_ready_peer(struct cpu *cpu) {
         return 0;
     }
     for (uint32_t p = 0; p < MAX_PRIORITY; p++) {
-        for (struct lwkt_thread *t = cpu->run_queues[p]; t; t = t->next) {
+        int guard = 0;
+        for (struct lwkt_thread *t = cpu->run_queues[p]; t && guard < MAX_THREADS;
+             t = t->next, guard++) {
             if (t == &cpu->idle) {
                 continue;
             }
@@ -205,17 +207,31 @@ static int any_cpu_has_ready_user_runner(void) {
             continue;
         }
         for (uint32_t p = 0; p < MAX_PRIORITY; p++) {
-            for (struct lwkt_thread *t = c->run_queues[p]; t; t = t->next) {
-                if (t == &c->idle) {
+            int guard = 0;
+            for (struct lwkt_thread *t = c->run_queues[p]; t && guard < MAX_THREADS;
+                 t = t->next, guard++) {
+                if (t == &c->idle || !t->user_proc) {
                     continue;
                 }
-                if (t->state == THREAD_READY && t->user_proc) {
+                if (t->state == THREAD_READY) {
                     return 1;
                 }
             }
         }
     }
     return 0;
+}
+
+static int idle_should_yield(struct cpu *cpu) {
+    if (!cpu) {
+        return 0;
+    }
+    if (!spin_trylock(&sched_lock)) {
+        return 0;
+    }
+    int wake = cpu_has_ready_peer(cpu) || any_cpu_has_ready_user_runner();
+    spin_unlock(&sched_lock);
+    return wake;
 }
 
 static struct cpu *pick_enqueue_cpu(void) {
@@ -349,7 +365,7 @@ static void idle_worker(void *arg) {
     for (;;) {
         struct cpu *cpu = this_cpu();
         lwkt_preempt_check();
-        if (cpu_has_ready_peer(cpu) || any_cpu_has_ready_user_runner()) {
+        if (idle_should_yield(cpu)) {
             lwkt_yield();
             continue;
         }
@@ -387,6 +403,7 @@ void lwkt_cpu_init_idle(void) {
     idle->yields = 0;
     idle->saved_kernel_rsp = 0;
     idle->mbox_slot = 0;
+    idle->pending_kill = 0;
     idle->wait_next = NULL;
     idle->mbox_wait_next = NULL;
     idle->uthread = NULL;
@@ -476,16 +493,15 @@ struct lwkt_thread *lwkt_create(const char *name, void (*entry)(void *), void *a
     if (!entry) {
         entry = worker_entry;
     }
-    if (!name || name[0] == '\0') {
-        char auto_name[16];
-        auto_name[0] = 't';
-        auto_name[1] = '0' + (char)(next_id % 10);
-        auto_name[2] = '\0';
-        name = auto_name;
-    }
-
     t->id = next_id++;
-    strcpy_local(t->name, name);
+
+    if (!name || name[0] == '\0') {
+        t->name[0] = 't';
+        t->name[1] = '0' + (char)(t->id % 10);
+        t->name[2] = '\0';
+    } else {
+        strcpy_local(t->name, name);
+    }
     t->priority = priority;
     t->state = THREAD_READY;
     t->entry_point = entry;
@@ -502,6 +518,7 @@ struct lwkt_thread *lwkt_create(const char *name, void (*entry)(void *), void *a
     t->runner_jmp.rsp = 0;
     t->in_syscall = 0;
     t->runner_reswitch = 0;
+    t->pending_kill = 0;
     t->wait_next = NULL;
     t->mbox_wait_next = NULL;
     t->mbox_slot = (uint8_t)((t - thread_pool) + 1);

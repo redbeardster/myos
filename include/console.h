@@ -30,6 +30,7 @@ void console_init(struct limine_framebuffer *fb);
 void console_setcolor(enum console_color fg, enum console_color bg);
 void console_putchar(char c);
 void console_writestring(const char *str);
+void console_write_n(const char *str, uint64_t len);
 void console_write_dec(uint64_t n);
 void console_write_hex(uint64_t n);
 void console_clear(void);

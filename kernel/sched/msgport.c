@@ -359,8 +359,15 @@ int msg_receive(struct msg *out, int block) {
         if (!already) {
             read_wait_enqueue(mb, self);
         }
-        token_unlock(&mb->lock);
-        lwkt_block();
+
+        if (lwkt_in_usersyscall()) {
+            token_unlock(&mb->lock);
+            lwkt_syscall_wait_edge();
+        } else {
+            self->state = THREAD_BLOCKED;
+            token_unlock(&mb->lock);
+            lwkt_switch();
+        }
     }
 }
 

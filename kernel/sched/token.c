@@ -67,8 +67,15 @@ void token_lock(struct token *t) {
         if (!already) {
             wait_enqueue(t, self);
         }
-        spin_unlock(&t->guard);
-        lwkt_block();
+
+        if (lwkt_in_usersyscall()) {
+            spin_unlock(&t->guard);
+            lwkt_syscall_wait_edge();
+        } else {
+            self->state = THREAD_BLOCKED;
+            spin_unlock(&t->guard);
+            lwkt_switch();
+        }
     }
 }
 
@@ -208,8 +215,15 @@ void token_shared_read_lock(struct token_shared *t) {
         if (!shared_wait_contains(&t->read_waiters, self)) {
             shared_wait_enqueue(&t->read_waiters, self);
         }
-        spin_unlock(&t->guard);
-        lwkt_block();
+
+        if (lwkt_in_usersyscall()) {
+            spin_unlock(&t->guard);
+            lwkt_syscall_wait_edge();
+        } else {
+            self->state = THREAD_BLOCKED;
+            spin_unlock(&t->guard);
+            lwkt_switch();
+        }
     }
 }
 
@@ -272,8 +286,15 @@ void token_shared_write_lock(struct token_shared *t) {
         if (!shared_wait_contains(&t->write_waiters, self)) {
             shared_wait_enqueue(&t->write_waiters, self);
         }
-        spin_unlock(&t->guard);
-        lwkt_block();
+
+        if (lwkt_in_usersyscall()) {
+            spin_unlock(&t->guard);
+            lwkt_syscall_wait_edge();
+        } else {
+            self->state = THREAD_BLOCKED;
+            spin_unlock(&t->guard);
+            lwkt_switch();
+        }
     }
 }
 

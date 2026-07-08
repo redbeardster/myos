@@ -200,49 +200,77 @@ void smp_start_aps(void) {
     __atomic_store_n(&smp_go, 1, __ATOMIC_RELEASE);
 }
 
-static const char *cpu_state_name(struct cpu *c) {
-    if (!c || !c->current) {
-        return "-";
+static void strcpy_snap(char *dst, const char *src, int cap) {
+    int i = 0;
+    if (!dst || cap <= 0) {
+        return;
     }
-    switch (c->current->state) {
-        case THREAD_READY: return "ready";
-        case THREAD_RUNNING: return "running";
-        case THREAD_BLOCKED: return "blocked";
-        case THREAD_TERMINATED: return "dead";
-        default: return "?";
+    while (src && src[i] && i < cap - 1) {
+        dst[i] = src[i];
+        i++;
     }
+    dst[i] = '\0';
 }
 
 void cpu_list(void) {
+    struct {
+        uint32_t id;
+        uint32_t lapic_id;
+        uint32_t switches;
+        int bsp;
+        int sched_active;
+        int has_current;
+        char tname[16];
+        enum thread_state tstate;
+    } snap[MAX_CPUS];
+    uint32_t ncpu = 0;
+
+    spin_lock(&cpu_list_lock);
+    ncpu = cpu_count;
+    for (uint32_t i = 0; i < ncpu && i < MAX_CPUS; i++) {
+        struct cpu *c = &cpus[i];
+        snap[i].id = c->id;
+        snap[i].lapic_id = c->lapic_id;
+        snap[i].switches = c->switches;
+        snap[i].bsp = c->bsp;
+        snap[i].sched_active = c->sched_active;
+        if (c->current) {
+            snap[i].has_current = 1;
+            snap[i].tstate = c->current->state;
+            strcpy_snap(snap[i].tname, c->current->name, (int)sizeof(snap[i].tname));
+        } else {
+            snap[i].has_current = 0;
+            snap[i].tname[0] = '\0';
+            snap[i].tstate = THREAD_READY;
+        }
+    }
+    spin_unlock(&cpu_list_lock);
+
     console_writestring("\nCPU  Lapic  BSP  Sched  Switches  Current thread\n");
     console_writestring("---  -----  ---  -----  --------  --------------\n");
 
-    uint32_t ncpu = cpu_online_count();
     for (uint32_t i = 0; i < ncpu; i++) {
-        struct cpu *c = cpu_by_id(i);
-        if (!c) {
-            continue;
-        }
-        console_write_dec(c->id);
+        console_write_dec(snap[i].id);
         console_writestring("    ");
-        console_write_dec(c->lapic_id);
+        console_write_dec(snap[i].lapic_id);
         console_writestring("      ");
-        console_writestring(c->bsp ? "yes" : "no ");
+        console_writestring(snap[i].bsp ? "yes" : "no ");
         console_writestring("   ");
-        console_writestring(c->sched_active ? "on " : "off");
+        console_writestring(snap[i].sched_active ? "on " : "off");
         console_writestring("    ");
-        console_write_dec(c->switches);
+        console_write_dec(snap[i].switches);
         console_writestring("        ");
 
-        if (c->current && c->current->id != 0) {
-            console_writestring(c->current->name);
+        if (snap[i].has_current) {
+            console_writestring(snap[i].tname);
             console_writestring(" (");
-            console_writestring(cpu_state_name(c));
-            console_putchar(')');
-        } else if (c->current) {
-            console_writestring(c->current->name);
-            console_writestring(" (");
-            console_writestring(cpu_state_name(c));
+            switch (snap[i].tstate) {
+                case THREAD_READY: console_writestring("ready"); break;
+                case THREAD_RUNNING: console_writestring("running"); break;
+                case THREAD_BLOCKED: console_writestring("blocked"); break;
+                case THREAD_TERMINATED: console_writestring("dead"); break;
+                default: console_writestring("?"); break;
+            }
             console_putchar(')');
         } else {
             console_writestring("-");

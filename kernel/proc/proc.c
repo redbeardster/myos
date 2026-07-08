@@ -82,10 +82,11 @@ static const char *state_name(enum proc_state state) {
 
 struct proc *proc_create(const char *name, uint64_t cr3, uint64_t entry,
                          uint64_t user_stack, int is_shell) {
-    spin_lock(&proc_table_lock);
+    uint64_t irqf;
+    spin_lock_irqsave(&proc_table_lock, &irqf);
     struct proc *p = alloc_proc();
     if (!p) {
-        spin_unlock(&proc_table_lock);
+        spin_unlock_irqrestore(&proc_table_lock, irqf);
         return NULL;
     }
 
@@ -108,7 +109,7 @@ struct proc *proc_create(const char *name, uint64_t cr3, uint64_t entry,
     p->threads = NULL;
     p->main_thread = NULL;
     proc_mutex_init_all(p->mutexes, PROC_MUTEX_MAX);
-    spin_unlock(&proc_table_lock);
+    spin_unlock_irqrestore(&proc_table_lock, irqf);
     return p;
 }
 
@@ -138,14 +139,15 @@ void proc_attach_uthread(struct proc *p, struct uthread *u) {
     if (!p || !u) {
         return;
     }
-    spin_lock(&proc_table_lock);
+    uint64_t irqf;
+    spin_lock_irqsave(&proc_table_lock, &irqf);
     u->next_in_proc = p->threads;
     p->threads = u;
     p->uthread_count++;
     if (!p->main_thread) {
         p->main_thread = u;
     }
-    spin_unlock(&proc_table_lock);
+    spin_unlock_irqrestore(&proc_table_lock, irqf);
 }
 
 void proc_detach_uthread(struct proc *p, struct uthread *u) {
@@ -153,7 +155,8 @@ void proc_detach_uthread(struct proc *p, struct uthread *u) {
         return;
     }
 
-    spin_lock(&proc_table_lock);
+    uint64_t irqf;
+    spin_lock_irqsave(&proc_table_lock, &irqf);
     struct uthread **slot = &p->threads;
     while (*slot) {
         if (*slot == u) {
@@ -163,12 +166,12 @@ void proc_detach_uthread(struct proc *p, struct uthread *u) {
             if (p->main_thread == u) {
                 p->main_thread = p->threads;
             }
-            spin_unlock(&proc_table_lock);
+            spin_unlock_irqrestore(&proc_table_lock, irqf);
             return;
         }
         slot = &(*slot)->next_in_proc;
     }
-    spin_unlock(&proc_table_lock);
+    spin_unlock_irqrestore(&proc_table_lock, irqf);
 }
 
 void proc_on_uthread_exit(struct proc *p, struct uthread *u) {
@@ -176,7 +179,11 @@ void proc_on_uthread_exit(struct proc *p, struct uthread *u) {
         return;
     }
 
-    proc_detach_uthread(p, u);
+    if (u) {
+        proc_detach_uthread(p, u);
+    }
+
+    uthread_reap_proc(p);
 
     if (p->uthread_count > 0) {
         return;
@@ -214,17 +221,18 @@ void proc_destroy(struct proc *p) {
         return;
     }
 
-    spin_lock(&proc_table_lock);
+    uint64_t irqf;
+    spin_lock_irqsave(&proc_table_lock, &irqf);
 
     if (p->runner && p->runner->id) {
         struct lwkt_thread *cur = lwkt_curthread();
         uint32_t rid = p->runner->id;
         p->runner = NULL;
-        spin_unlock(&proc_table_lock);
+        spin_unlock_irqrestore(&proc_table_lock, irqf);
         if (cur != lwkt_find(rid)) {
             lwkt_destroy(rid);
         }
-        spin_lock(&proc_table_lock);
+        spin_lock_irqsave(&proc_table_lock, &irqf);
     }
 
     if (p->cr3) {
@@ -234,7 +242,7 @@ void proc_destroy(struct proc *p) {
     }
 
     proc_reset_slot(p);
-    spin_unlock(&proc_table_lock);
+    spin_unlock_irqrestore(&proc_table_lock, irqf);
 }
 
 void proc_kill_children(void) {

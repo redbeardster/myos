@@ -33,6 +33,10 @@ int uthread_ptr_valid(const struct uthread *u) {
     return ((p - lo) % sizeof(struct uthread)) == 0;
 }
 
+static struct uthread *alloc_slot(void);
+static struct uthread *find_by_id(uint32_t id);
+static void uthread_reset_slot(struct uthread *u);
+
 static int join_take_result(uint32_t uthread_id, int *exit_code_out) {
     if (uthread_id == 0 || uthread_id >= MAX_UTHREAD_IDS) {
         return 0;
@@ -44,6 +48,20 @@ static int join_take_result(uint32_t uthread_id, int *exit_code_out) {
         *exit_code_out = join_exit_code[uthread_id];
     }
     __atomic_store_n(&join_exit_valid[uthread_id], 0, __ATOMIC_RELEASE);
+    return 1;
+}
+
+static int join_take_and_reap(uint32_t uthread_id, int *exit_code_out) {
+    if (!join_take_result(uthread_id, exit_code_out)) {
+        return 0;
+    }
+    struct uthread *u = find_by_id(uthread_id);
+    if (u) {
+        if (u->proc) {
+            proc_detach_uthread(u->proc, u);
+        }
+        uthread_reset_slot(u);
+    }
     return 1;
 }
 
@@ -304,7 +322,17 @@ static void uthread_exit_runner(struct proc *p, struct uthread *u) {
         cur->in_syscall = 0;
         cur->user_proc = NULL;
     }
-    proc_on_uthread_exit(p, u);
+    if (u) {
+        uint64_t jirqf;
+        spin_lock_irqsave(&uthread_join_lock, &jirqf);
+        if (u->uthread_id < MAX_UTHREAD_IDS) {
+            __atomic_store_n(&join_exit_valid[u->uthread_id], 0, __ATOMIC_RELEASE);
+        }
+        uthread_reset_slot(u);
+        spin_unlock_irqrestore(&uthread_join_lock, jirqf);
+    }
+    uthread_reap_proc(p);
+    proc_on_uthread_exit(p, NULL);
     lwkt_thread_exit();
 }
 
@@ -334,6 +362,12 @@ static void proc_runner_entry(void *arg) {
         if (resumed != 0) {
             runner->in_syscall = 0;
             p->current_uthread = NULL;
+
+            if (runner->pending_kill) {
+                runner->pending_kill = 0;
+                proc_destroy(p);
+                lwkt_thread_exit();
+            }
         }
 
         struct uthread *u = proc_sched_pick(p);
@@ -367,6 +401,33 @@ static void proc_runner_entry(void *arg) {
 
         runner->in_syscall = 0;
         p->current_uthread = NULL;
+    }
+}
+
+void uthread_reap_proc(struct proc *p) {
+    if (!p) {
+        return;
+    }
+
+    for (;;) {
+        struct uthread *t;
+        uint64_t irqf;
+
+        spin_lock_irqsave(&uthread_join_lock, &irqf);
+        t = p->threads;
+        spin_unlock_irqrestore(&uthread_join_lock, irqf);
+        if (!t) {
+            break;
+        }
+
+        proc_detach_uthread(p, t);
+
+        spin_lock_irqsave(&uthread_join_lock, &irqf);
+        if (t->uthread_id < MAX_UTHREAD_IDS) {
+            __atomic_store_n(&join_exit_valid[t->uthread_id], 0, __ATOMIC_RELEASE);
+        }
+        uthread_reset_slot(t);
+        spin_unlock_irqrestore(&uthread_join_lock, irqf);
     }
 }
 
@@ -617,14 +678,20 @@ void uthread_exit(void) {
         lwkt_thread_exit();
     }
 
+    if (p->uthread_count == 0) {
+        uthread_exit_runner(p, u);
+        return;
+    }
+
     int live = 0;
     for (struct uthread *walk = p->threads; walk; walk = walk->next_in_proc) {
-        if (walk->state != UTHREAD_ZOMBIE) {
+        if (walk->state != UTHREAD_ZOMBIE && walk->uthread_id != 0) {
             live++;
         }
     }
 
     if (live == 0) {
+        uthread_reap_proc(p);
         uthread_exit_runner(p, u);
         return;
     }
@@ -644,14 +711,14 @@ int uthread_join(uint32_t uthread_id, int *exit_code_out) {
         struct uthread *self = uthread_current();
 
         spin_lock_irqsave(&uthread_join_lock, &irqf);
-        if (join_take_result(uthread_id, exit_code_out)) {
+        if (join_take_and_reap(uthread_id, exit_code_out)) {
             spin_unlock_irqrestore(&uthread_join_lock, irqf);
             return 0;
         }
 
         u = find_by_id(uthread_id);
         if (!u || u->proc != p) {
-            if (join_take_result(uthread_id, exit_code_out)) {
+            if (join_take_and_reap(uthread_id, exit_code_out)) {
                 spin_unlock_irqrestore(&uthread_join_lock, irqf);
                 return 0;
             }

@@ -55,6 +55,7 @@ isr_common:
     mov rdi, [rsp + 15 * 8]     ; int_no (vector)
     mov rsi, [rsp + 16 * 8]     ; err_code
     mov rdx, [rsp + 17 * 8]     ; rip
+    lea rcx, [rsp + 17 * 8]     ; &rip — for fixup overwrite
     call interrupt_handler
 
     pop r15
@@ -196,6 +197,16 @@ syscall_common:
 
 extern syscall_dispatch
 extern syscall_post_dispatch
+
+global syscall_pf_fixup
+syscall_pf_fixup:
+    ; iretq redirected here from #PF handler during syscall.
+    ; RAX = -1 (set by saved_rax overwrite in PF handler).
+    ; RSP = interrupted context (inside syscall_dispatch) — not clean,
+    ; but syscall_post_dispatch immediately calls runner_longjmp (noreturn).
+    mov rdi, -1
+    call syscall_post_dispatch
+    hlt
 
 global user_enter_asm
 

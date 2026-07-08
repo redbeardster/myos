@@ -5,6 +5,8 @@
 #include "keyboard.h"
 #include "lapic.h"
 #include "lwkt.h"
+#include "myos_abi.h"
+#include "proc.h"
 
 #define PIC1_COMMAND 0x20
 #define PIC1_DATA    0x21
@@ -214,7 +216,7 @@ void interrupts_enable(void) {
     __asm__ volatile("sti");
 }
 
-void interrupt_handler(uint64_t int_no, uint64_t err_code, uint64_t rip) {
+void interrupt_handler(uint64_t int_no, uint64_t err_code, uint64_t rip, uint64_t *saved_rip_frame) {
     (void)err_code;
 
     if (int_no == LAPIC_TIMER_VECTOR) {
@@ -256,6 +258,30 @@ void interrupt_handler(uint64_t int_no, uint64_t err_code, uint64_t rip) {
     if (int_no < 32) {
         uint64_t cr2;
         __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+
+        int user_fault = (err_code & 4) || (rip >= MYOS_USER_BASE && rip < MYOS_USER_STACK_TOP);
+
+        if (user_fault && int_no == 14) {
+            struct lwkt_thread *cur = lwkt_curthread();
+            struct proc *p = cur ? cur->user_proc : NULL;
+            if (p && !p->is_shell) {
+                console_writestring("\n[PF] killed pid=");
+                console_write_dec(p->pid);
+                console_writestring(" (");
+                console_writestring(p->name);
+                console_writestring(") cr2=");
+                console_write_hex(cr2);
+                console_putchar('\n');
+                if (cur->in_syscall && saved_rip_frame) {
+                    cur->pending_kill = 1;
+                    saved_rip_frame[-3] = (uint64_t)-1;
+                    saved_rip_frame[0] = (uint64_t)&syscall_pf_fixup;
+                    return;
+                }
+                lwkt_thread_exit();
+                return;
+            }
+        }
 
         console_writestring("\nCPU exception ");
         console_write_dec(int_no);

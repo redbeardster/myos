@@ -21,6 +21,8 @@ void *user_page_alloc(void) {
         return NULL;
     }
 
+    __builtin_memset(page, 0, PAGE_SIZE);
+
     uint64_t virt = p->heap_next;
     p->heap_next += PAGE_SIZE;
 
