@@ -214,7 +214,7 @@ void interrupts_enable(void) {
     __asm__ volatile("sti");
 }
 
-void interrupt_handler(uint64_t int_no, uint64_t err_code) {
+void interrupt_handler(uint64_t int_no, uint64_t err_code, uint64_t rip) {
     (void)err_code;
 
     if (int_no == LAPIC_TIMER_VECTOR) {
@@ -263,6 +263,15 @@ void interrupt_handler(uint64_t int_no, uint64_t err_code) {
         console_write_hex(err_code);
         console_writestring(" cr2=");
         console_write_hex(cr2);
+        console_writestring(" rip=");
+        console_write_hex(rip);
+        struct lwkt_thread *cur = lwkt_curthread();
+        if (cur) {
+            console_writestring(" lwkt=");
+            console_write_dec(cur->id);
+            console_writestring(" ");
+            console_writestring(cur->name);
+        }
         console_writestring("\n");
         for (;;) {
             __asm__ volatile("hlt");

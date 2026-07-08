@@ -12,8 +12,15 @@ global isr24, isr25, isr26, isr27, isr28, isr29, isr30, isr31
 global isr32, isr33, isr34, isr35, isr36, isr37, isr38, isr39
 global isr40, isr41, isr42, isr43, isr44, isr45, isr46, isr47, isr64, isr65
 global gdt_load, idt_load, switch_context, thread_bootstrap
-global isr128, user_enter_asm, load_tss
-global syscall_frame_user_rip_rsp_get, syscall_frame_user_rdi_get
+global isr128, user_enter_asm, load_tss, runner_setjmp, runner_longjmp
+
+%define UTHREAD_USER_RBX_OFF        72
+%define UTHREAD_USER_RBP_OFF        80
+%define UTHREAD_USER_R12_OFF        88
+%define UTHREAD_USER_R13_OFF        96
+%define UTHREAD_USER_R14_OFF        104
+%define UTHREAD_USER_R15_OFF        112
+%define UTHREAD_USER_REGS_VALID_OFF 120
 
 %macro ISR_NOERR 1
 isr%1:
@@ -45,8 +52,9 @@ isr_common:
     push r14
     push r15
 
-    mov rdi, [rsp + 15 * 8]
-    mov rsi, [rsp + 15 * 8 + 8]
+    mov rdi, [rsp + 15 * 8]     ; int_no (vector)
+    mov rsi, [rsp + 16 * 8]     ; err_code
+    mov rdx, [rsp + 17 * 8]     ; rip
     call interrupt_handler
 
     pop r15
@@ -125,6 +133,7 @@ isr128:
     jmp syscall_common
 
 syscall_common:
+    cli
     push rax
     push rbx
     push rcx
@@ -141,11 +150,30 @@ syscall_common:
     push r14
     push r15
 
-    mov rdi, [rsp + 14 * 8]     ; syscall number (rax)
-    mov rsi, [rsp + 9 * 8]      ; arg1 (rdi)
-    mov rdx, [rsp + 10 * 8]     ; arg2 (rsi)
-    mov rcx, [rsp + 11 * 8]     ; arg3 (rdx)
+    sub rsp, 48
+    mov rax, [rsp + 48 + 104]
+    mov [rsp + 0], rax
+    mov rax, [rsp + 48 + 64]
+    mov [rsp + 8], rax
+    mov rax, [rsp + 48 + 24]
+    mov [rsp + 16], rax
+    mov rax, [rsp + 48 + 16]
+    mov [rsp + 24], rax
+    mov rax, [rsp + 48 + 8]
+    mov [rsp + 32], rax
+    mov rax, [rsp + 48 + 0]
+    mov [rsp + 40], rax
+
+    mov rdi, [rsp + 48 + 14 * 8]
+    mov rsi, [rsp + 48 + 9 * 8]
+    mov rdx, [rsp + 48 + 10 * 8]
+    mov rcx, [rsp + 48 + 11 * 8]
+    mov r8,  [rsp + 48 + 17 * 8]
+    mov r9,  [rsp + 48 + 20 * 8]
     call syscall_dispatch
+    mov rdi, rax
+    call syscall_post_dispatch
+    add rsp, 48
     mov [rsp + 14 * 8], rax
 
     pop r15
@@ -167,28 +195,25 @@ syscall_common:
     iretq
 
 extern syscall_dispatch
-
-; rdi = rip*, rsi = rsp* — user frame below saved GPRs on syscall stack
-global syscall_frame_user_rip_rsp_get
-syscall_frame_user_rip_rsp_get:
-    mov rax, [rsp + 17 * 8]
-    mov [rdi], rax
-    mov rax, [rsp + 20 * 8]
-    mov [rsi], rax
-    ret
-
-; rdi = rdi* — user rdi at syscall entry
-global syscall_frame_user_rdi_get
-syscall_frame_user_rdi_get:
-    mov rax, [rsp + 8 * 8]
-    mov [rdi], rax
-    ret
+extern syscall_post_dispatch
 
 global user_enter_asm
 
 user_enter_asm:
-    ; rdi = rip, rsi = rsp, rdx = arg, rcx = &saved_kernel_rsp, r8 = user_rax
+    ; rdi = rip, rsi = rsp, rdx = arg, rcx = &saved_kernel_rsp, r8 = user_rax, r9 = uthread*
     mov [rcx], rsp
+    test r9, r9
+    jz .user_no_restore
+    cmp byte [r9 + UTHREAD_USER_REGS_VALID_OFF], 0
+    je .user_no_restore
+    mov rbx, [r9 + UTHREAD_USER_RBX_OFF]
+    mov rbp, [r9 + UTHREAD_USER_RBP_OFF]
+    mov r12, [r9 + UTHREAD_USER_R12_OFF]
+    mov r13, [r9 + UTHREAD_USER_R13_OFF]
+    mov r14, [r9 + UTHREAD_USER_R14_OFF]
+    mov r15, [r9 + UTHREAD_USER_R15_OFF]
+    mov byte [r9 + UTHREAD_USER_REGS_VALID_OFF], 0
+.user_no_restore:
     mov r9, r8
     mov r8, rdi
     mov rdi, rdx
@@ -253,3 +278,35 @@ thread_bootstrap:
     pop rax
     call rax
     jmp lwkt_thread_exit
+
+global runner_setjmp
+runner_setjmp:
+    ; rdi = buf
+    mov [rdi + 0], rsp
+    mov [rdi + 8], rbx
+    mov [rdi + 16], rbp
+    mov [rdi + 24], r12
+    mov [rdi + 32], r13
+    mov [rdi + 40], r14
+    mov [rdi + 48], r15
+    mov rax, [rsp]
+    mov [rdi + 56], rax
+    xor rax, rax
+    ret
+
+global runner_longjmp
+runner_longjmp:
+    ; rdi = buf, rsi = val
+    mov rsp, [rdi + 0]
+    mov rbx, [rdi + 8]
+    mov rbp, [rdi + 16]
+    mov r12, [rdi + 24]
+    mov r13, [rdi + 32]
+    mov r14, [rdi + 40]
+    mov r15, [rdi + 48]
+    mov rax, rsi
+    test rax, rax
+    jnz .runner_longjmp_done
+    mov rax, 1
+.runner_longjmp_done:
+    jmp qword [rdi + 56]

@@ -5,6 +5,7 @@
 #include "spinlock.h"
 
 #define KEYBOARD_PORT 0x60
+#define KEYBOARD_STATUS_PORT 0x64
 #define KBD_RING_SIZE 64
 
 static volatile uint8_t kbd_ring[KBD_RING_SIZE];
@@ -85,6 +86,18 @@ int keyboard_pop_scancode(uint8_t *scancode) {
     int ok = ring_pop_locked(scancode);
     spin_unlock_irqrestore(&kbd_lock, irqf);
     return ok;
+}
+
+int keyboard_poll_scancode(uint8_t *scancode) {
+    if (!scancode) {
+        return 0;
+    }
+    uint8_t status = inb(KEYBOARD_STATUS_PORT);
+    if ((status & 0x01) == 0) {
+        return 0;
+    }
+    *scancode = inb(KEYBOARD_PORT);
+    return 1;
 }
 
 char keyboard_translate_scancode(uint8_t scancode) {

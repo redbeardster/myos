@@ -167,6 +167,32 @@ cpus
 
 ---
 
+## Фаза 7b — proc-runner hardening (syscall resched) 🔄
+
+**Цель:** единый безопасный путь для блокирующих syscall внутри runner (`MYOS_ERR_AGAIN` + `wait_edge`), без `lwkt_block()`-loop в syscall.
+
+**Что уже сделано:**
+
+- `lwkt_syscall_resched(retry_ret)` в `lwkt.c`/`lwkt.h`;
+- `uthread_join` и `proc_mutex_lock` переведены на helper;
+- `SYS_MSG_RECV` и `SYS_MSG_PING` в runner переведены на non-block receive + retry (`MYOS_ERR_AGAIN`);
+- `myos_msg_ping()` добавлен retry-loop в `user/myos.h`.
+
+**Осталось закрыть вручную в рантайме (`SMP=8`):**
+
+```text
+ping
+msg hello
+exec threads.elf
+threads
+uthreads
+cpus
+```
+
+**Критерий done:** нет зависаний shell, `ping/msg` работают под proc-runner, `threads.elf` завершает join/exit.
+
+---
+
 ## Зависимости
 
 ```mermaid

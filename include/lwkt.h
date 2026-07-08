@@ -8,7 +8,8 @@ struct proc;
 
 #define MAX_THREADS 32
 #define MAX_PRIORITY 16
-#define STACK_SIZE 4096
+#define STACK_SIZE 8192
+#define SYSCALL_STACK_SIZE 8192
 
 #define LWKT_PRIO_SHELL    0
 #define LWKT_PRIO_HIGH     2
@@ -21,6 +22,17 @@ enum thread_state {
     THREAD_BLOCKED = 2,
     THREAD_TERMINATED = 3
 };
+
+typedef struct {
+    uint64_t rsp;
+    uint64_t rbx;
+    uint64_t rbp;
+    uint64_t r12;
+    uint64_t r13;
+    uint64_t r14;
+    uint64_t r15;
+    uint64_t rip;
+} runner_jmp_buf;
 
 struct lwkt_thread {
     uint32_t id;
@@ -39,12 +51,19 @@ struct lwkt_thread {
     uint64_t yields;
     uint64_t saved_kernel_rsp;
     uint64_t runner_resume_rsp;
+    runner_jmp_buf runner_jmp;
     uint8_t in_syscall;
+    uint8_t runner_reswitch;
     uint8_t mbox_slot;
     struct lwkt_thread *wait_next;      /* token / proc_mutex wait queues */
     struct lwkt_thread *mbox_wait_next; /* msgport read_waiters only */
     uint8_t stack[STACK_SIZE];
+    uint8_t syscall_stack[SYSCALL_STACK_SIZE];
 };
+
+static inline uint64_t lwkt_thread_syscall_rsp0(struct lwkt_thread *t) {
+    return ((uint64_t)(uintptr_t)t->syscall_stack + SYSCALL_STACK_SIZE) & ~0xFULL;
+}
 
 void lwkt_init(void);
 void lwkt_sched_start(void);
@@ -77,5 +96,9 @@ void lwkt_bootstrap_first(void);
 
 int lwkt_in_usersyscall(void);
 void lwkt_syscall_wait_edge(void);
+int lwkt_syscall_resched(int64_t retry_ret);
+
+int runner_setjmp(runner_jmp_buf *buf) __attribute__((returns_twice));
+void runner_longjmp(runner_jmp_buf *buf, int val) __attribute__((noreturn));
 
 #endif

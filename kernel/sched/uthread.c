@@ -20,8 +20,18 @@ static volatile int join_exit_valid[MAX_UTHREAD_IDS];
 static spinlock_t uthread_join_lock;
 static uint32_t next_global_uthread_id = 1;
 
-extern void syscall_frame_user_rip_rsp_get(uint64_t *rip, uint64_t *rsp);
-extern void syscall_frame_user_rdi_get(uint64_t *rdi);
+int uthread_ptr_valid(const struct uthread *u) {
+    if (!u) {
+        return 0;
+    }
+    uintptr_t lo = (uintptr_t)uthread_pool;
+    uintptr_t hi = lo + sizeof(uthread_pool);
+    uintptr_t p = (uintptr_t)u;
+    if (p < lo || p >= hi) {
+        return 0;
+    }
+    return ((p - lo) % sizeof(struct uthread)) == 0;
+}
 
 static int join_take_result(uint32_t uthread_id, int *exit_code_out) {
     if (uthread_id == 0 || uthread_id >= MAX_UTHREAD_IDS) {
@@ -78,6 +88,13 @@ static void uthread_reset_slot(struct uthread *u) {
     u->user_rsp = 0;
     u->user_rdi = 0;
     u->user_syscall_ret = 0;
+    u->user_rbx = 0;
+    u->user_rbp = 0;
+    u->user_r12 = 0;
+    u->user_r13 = 0;
+    u->user_r14 = 0;
+    u->user_r15 = 0;
+    u->user_regs_valid = 0;
     u->user_arg = 0;
     u->user_stack_base = 0;
     u->exit_code = 0;
@@ -111,7 +128,6 @@ static void uthread_release_resources(struct uthread *u) {
 
 static void uthread_make_zombie(struct uthread *u) {
     uthread_release_resources(u);
-    u->join_waiter = NULL;
     u->state = UTHREAD_ZOMBIE;
     u->lwkt = NULL;
 }
@@ -181,9 +197,22 @@ static void uthread_wakeup_joiner(struct uthread *u) {
     u->join_waiter = NULL;
     if (w->state == UTHREAD_BLOCKED && w->proc) {
         w->state = UTHREAD_RUNNABLE;
+        w->user_syscall_ret = (uint64_t)MYOS_ERR_AGAIN;
         proc_sched_enqueue(w->proc, w);
         proc_runner_resched(w->proc);
     }
+}
+
+static int proc_sched_has_runnable_other(struct proc *p, struct uthread *skip) {
+    if (!p) {
+        return 0;
+    }
+    for (struct uthread *u = p->run_queue; u; u = u->run_next) {
+        if (u != skip && u->state == UTHREAD_RUNNABLE) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 static struct uthread *proc_sched_pick_other(struct proc *p, struct uthread *skip) {
@@ -219,7 +248,35 @@ static struct uthread *proc_sched_pick_other(struct proc *p, struct uthread *ski
 }
 
 static struct uthread *proc_sched_pick(struct proc *p) {
-    return proc_sched_pick_other(p, NULL);
+    struct uthread *u = proc_sched_pick_other(p, NULL);
+    if (u) {
+        return u;
+    }
+
+    /* Heal RUNNABLE uthreads that lost their run_queue link. */
+    for (struct uthread *walk = p->threads; walk; walk = walk->next_in_proc) {
+        if (walk->state != UTHREAD_RUNNABLE) {
+            continue;
+        }
+        proc_sched_remove(p, walk);
+        walk->run_next = NULL;
+        return walk;
+    }
+
+    return NULL;
+}
+
+static int uthread_user_ctx_valid(const struct uthread *u) {
+    if (!u) {
+        return 0;
+    }
+    if (u->user_rip < MYOS_USER_BASE || u->user_rip >= MYOS_USER_STACK_TOP) {
+        return 0;
+    }
+    if (u->user_rsp < MYOS_USER_STACK_BASE || u->user_rsp >= MYOS_USER_STACK_TOP) {
+        return 0;
+    }
+    return 1;
 }
 
 void proc_runner_resched(struct proc *p) {
@@ -233,22 +290,52 @@ void proc_runner_resched(struct proc *p) {
 }
 
 static void uthread_return_to_runner(struct proc *p) {
-    if (!p || !p->runner || p->runner->runner_resume_rsp == 0) {
-        return;
-    }
-    uint64_t rsp = p->runner->runner_resume_rsp;
-    __asm__ volatile("mov %0, %%rsp" : : "r"(rsp) : "memory");
-    __asm__ volatile("ret");
-    __builtin_unreachable();
-}
-
-static void proc_runner_entry(void *arg) {
-    struct proc *p = (struct proc *)arg;
-    if (!p || !p->runner) {
+    struct lwkt_thread *cur = lwkt_curthread();
+    if (!cur || !p || p->runner != cur) {
         lwkt_thread_exit();
     }
 
+    cur->runner_reswitch = 1;
+}
+
+static void uthread_exit_runner(struct proc *p, struct uthread *u) {
+    struct lwkt_thread *cur = lwkt_curthread();
+    if (cur) {
+        cur->in_syscall = 0;
+        cur->user_proc = NULL;
+    }
+    proc_on_uthread_exit(p, u);
+    lwkt_thread_exit();
+}
+
+static void proc_runner_entry(void *arg) {
+    (void)arg;
+
     for (;;) {
+        struct lwkt_thread *runner = lwkt_curthread();
+        struct proc *p = runner ? runner->user_proc : NULL;
+        int resumed;
+
+        if (!p || p->pid == 0 || p->state != PROC_RUNNING || p->runner != runner) {
+            lwkt_thread_exit();
+        }
+
+        resumed = runner_setjmp(&runner->runner_jmp);
+        /*
+         * setjmp/longjmp clobbers stack locals; reload from the LWKT thread
+         * object after every return (first entry and longjmp resume).
+         */
+        runner = lwkt_curthread();
+        p = runner ? runner->user_proc : NULL;
+        if (!p || p->runner != runner) {
+            lwkt_thread_exit();
+        }
+
+        if (resumed != 0) {
+            runner->in_syscall = 0;
+            p->current_uthread = NULL;
+        }
+
         struct uthread *u = proc_sched_pick(p);
         if (!u) {
             lwkt_block();
@@ -257,19 +344,28 @@ static void proc_runner_entry(void *arg) {
 
         p->current_uthread = u;
         u->state = UTHREAD_RUNNING;
-        p->runner->user_cr3 = p->cr3;
+        runner->user_cr3 = p->cr3;
 
-        if (!u->user_rip || !u->user_rsp) {
+        if (!uthread_user_ctx_valid(u)) {
+            console_writestring("\nproc-runner: invalid user ctx pid=");
+            console_write_dec(p->pid);
+            console_writestring(" tid=");
+            console_write_dec(u->uthread_id);
+            console_writestring(" rip=");
+            console_write_hex(u->user_rip);
+            console_writestring(" rsp=");
+            console_write_hex(u->user_rsp);
+            console_putchar('\n');
             proc_sched_remove(p, u);
             p->current_uthread = NULL;
-            continue;
+            proc_destroy(p);
+            lwkt_thread_exit();
         }
 
-        __asm__ volatile("mov %%rsp, %0" : "=r"(p->runner->runner_resume_rsp));
-
         user_enter(u->user_rip, u->user_rsp, u->user_rdi, u->user_syscall_ret,
-                   &p->runner->saved_kernel_rsp);
+                   &runner->saved_kernel_rsp, u);
 
+        runner->in_syscall = 0;
         p->current_uthread = NULL;
     }
 }
@@ -341,6 +437,13 @@ static struct uthread *uthread_alloc_user(struct proc *p, uint64_t rip, uint64_t
     u->user_arg = arg;
     u->user_stack_base = stack_base;
     u->user_syscall_ret = 0;
+    u->user_rbx = 0;
+    u->user_rbp = 0;
+    u->user_r12 = 0;
+    u->user_r13 = 0;
+    u->user_r14 = 0;
+    u->user_r15 = 0;
+    u->user_regs_valid = 0;
 
     proc_attach_uthread(p, u);
     proc_sched_enqueue(p, u);
@@ -455,21 +558,6 @@ struct uthread *uthread_current(void) {
     return p ? p->current_uthread : NULL;
 }
 
-static void uthread_save_syscall_frame(struct uthread *u) {
-    uint64_t rip = 0;
-    uint64_t rsp = 0;
-    uint64_t rdi = 0;
-    syscall_frame_user_rip_rsp_get(&rip, &rsp);
-    syscall_frame_user_rdi_get(&rdi);
-    if (rip) {
-        u->user_rip = rip;
-    }
-    if (rsp) {
-        u->user_rsp = rsp;
-    }
-    u->user_rdi = rdi;
-}
-
 void uthread_yield(void) {
     struct proc *p = proc_current();
     struct lwkt_thread *runner = p ? p->runner : NULL;
@@ -485,21 +573,18 @@ void uthread_yield(void) {
         return;
     }
 
-    uthread_save_syscall_frame(cur);
-
     if (cur->state != UTHREAD_BLOCKED) {
         proc_sched_enqueue(p, cur);
     }
 
-    struct uthread *next = proc_sched_pick_other(p, cur);
-    if (!next) {
+    if (!proc_sched_has_runnable_other(p, cur)) {
         if (lwkt_in_usersyscall()) {
             lwkt_syscall_wait_edge();
         }
         return;
     }
 
-    runner->in_syscall = 0;
+    cur->user_syscall_ret = (uint64_t)MYOS_ERR_AGAIN;
     uthread_return_to_runner(p);
 }
 
@@ -540,8 +625,8 @@ void uthread_exit(void) {
     }
 
     if (live == 0) {
-        proc_on_uthread_exit(p, u);
-        lwkt_thread_exit();
+        uthread_exit_runner(p, u);
+        return;
     }
 
     uthread_return_to_runner(p);
@@ -592,22 +677,7 @@ int uthread_join(uint32_t uthread_id, int *exit_code_out) {
         spin_unlock_irqrestore(&uthread_join_lock, irqf);
 
         uthread_yield();
-        if (lwkt_in_usersyscall()) {
-            if (self) {
-                self->user_syscall_ret = (uint64_t)(int64_t)MYOS_ERR_AGAIN;
-            }
-            lwkt_syscall_wait_edge();
-            return MYOS_ERR_AGAIN;
-        }
-
-        if (self) {
-            spin_lock_irqsave(&uthread_join_lock, &irqf);
-            u = find_by_id(uthread_id);
-            if (u) {
-                u->join_waiter = NULL;
-            }
-            spin_unlock_irqrestore(&uthread_join_lock, irqf);
-        }
+        return MYOS_ERR_AGAIN;
     }
 }
 

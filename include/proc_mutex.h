@@ -12,6 +12,7 @@ struct uthread;
 
 struct proc_mutex {
     struct token lock;
+    struct uthread *uthread_holder;
 };
 
 void proc_mutex_init_all(struct proc_mutex *mutexes, int count);

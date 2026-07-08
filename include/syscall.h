@@ -28,6 +28,11 @@
 #define SYS_MSG_PORTS     MYOS_SYS_MSG_PORTS
 
 void syscall_init(void);
-uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3);
+uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
+                          uint64_t user_rip, uint64_t user_rsp,
+                          uint64_t user_rbx, uint64_t user_rbp,
+                          uint64_t user_r12, uint64_t user_r13,
+                          uint64_t user_r14, uint64_t user_r15);
+uint64_t syscall_post_dispatch(uint64_t ret);
 
 #endif

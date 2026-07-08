@@ -14,6 +14,7 @@ void proc_mutex_init_all(struct proc_mutex *mutexes, int count) {
     }
     for (int i = 0; i < count; i++) {
         token_init(&mutexes[i].lock);
+        mutexes[i].uthread_holder = NULL;
     }
 }
 
@@ -27,13 +28,24 @@ int proc_mutex_lock_slot(struct proc_mutex *mutexes, int count, uint32_t id) {
     struct uthread *u = uthread_current();
     struct lwkt_thread *self = lwkt_curthread();
 
+    if (tok->holder == self && mutexes[id].uthread_holder != NULL &&
+        mutexes[id].uthread_holder != u) {
+        if (p && p->runner == self && u && lwkt_in_usersyscall()) {
+            uthread_yield();
+            return MYOS_ERR_AGAIN;
+        }
+        token_lock(tok);
+        mutexes[id].uthread_holder = u;
+        return 0;
+    }
+
     if (token_trylock(tok)) {
+        mutexes[id].uthread_holder = u;
         return 0;
     }
 
     if (p && p->runner == self && u && lwkt_in_usersyscall()) {
         uthread_yield();
-        lwkt_syscall_wait_edge();
         return MYOS_ERR_AGAIN;
     }
 
@@ -50,6 +62,7 @@ int proc_mutex_unlock_slot(struct proc_mutex *mutexes, int count, uint32_t id) {
     if (!self || mutexes[id].lock.holder != self) {
         return -2;
     }
+    mutexes[id].uthread_holder = NULL;
     token_unlock(&mutexes[id].lock);
     proc_runner_resched(proc_current());
     return 0;
@@ -64,6 +77,9 @@ void proc_mutex_abandon_all(struct proc_mutex *mutexes, int count, struct uthrea
         count = PROC_MUTEX_MAX;
     }
     for (int i = 0; i < count; i++) {
-        token_drop_holder(&mutexes[i].lock, runner);
+        if (mutexes[i].uthread_holder == u) {
+            token_drop_holder(&mutexes[i].lock, runner);
+            mutexes[i].uthread_holder = NULL;
+        }
     }
 }

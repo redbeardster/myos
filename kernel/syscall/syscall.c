@@ -12,6 +12,22 @@
 #include "user.h"
 #include "uthread.h"
 
+static void syscall_stash_user_callee(struct uthread *u, uint64_t rbx, uint64_t rbp,
+                                     uint64_t r12, uint64_t r13, uint64_t r14,
+                                     uint64_t r15) {
+    if (!uthread_ptr_valid(u)) {
+        return;
+    }
+
+    u->user_rbx = rbx;
+    u->user_rbp = rbp;
+    u->user_r12 = r12;
+    u->user_r13 = r13;
+    u->user_r14 = r14;
+    u->user_r15 = r15;
+    u->user_regs_valid = 1;
+}
+
 static void copy_from_user(char *dst, const char *src, uint64_t len) {
     for (uint64_t i = 0; i < len; i++) {
         dst[i] = src[i];
@@ -83,13 +99,44 @@ static int sys_exec(const char *name) {
     return exec_spawn_module(path, 0);
 }
 
-uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3) {
+static int syscall_msg_receive(struct msg *out, int block) {
+    if (!block || !lwkt_in_usersyscall()) {
+        return msg_receive(out, block);
+    }
+
+    int rc = msg_receive(out, 0);
+    if (rc == 1) {
+        lwkt_syscall_resched(MYOS_ERR_AGAIN);
+        return MYOS_ERR_AGAIN;
+    }
+    return rc;
+}
+
+uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
+                          uint64_t user_rip, uint64_t user_rsp,
+                          uint64_t user_rbx, uint64_t user_rbp,
+                          uint64_t user_r12, uint64_t user_r13,
+                          uint64_t user_r14, uint64_t user_r15) {
     struct lwkt_thread *cur = lwkt_curthread();
     if (cur) {
         cur->in_syscall = 1;
+        if (cur->user_proc && cur->user_proc->current_uthread) {
+            struct uthread *u = cur->user_proc->current_uthread;
+            if (uthread_ptr_valid(u)) {
+                syscall_stash_user_callee(u, user_rbx, user_rbp, user_r12, user_r13,
+                                          user_r14, user_r15);
+                if (user_rip >= MYOS_USER_BASE && user_rip < MYOS_USER_STACK_TOP) {
+                    u->user_rip = user_rip;
+                }
+                if (user_rsp >= MYOS_USER_STACK_BASE && user_rsp < MYOS_USER_STACK_TOP) {
+                    u->user_rsp = user_rsp;
+                }
+                u->user_rdi = a1;
+            }
+        }
     }
 
-    uint64_t ret;
+    uint64_t ret = 0;
 
     switch (num) {
         case SYS_EXIT: {
@@ -98,7 +145,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3) {
                 u->exit_code = (int)a1;
             }
             uthread_exit();
-            __builtin_unreachable();
+            break;
         }
 
         case SYS_WRITE:
@@ -135,7 +182,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3) {
         case SYS_MSG_RECV: {
             struct msg m;
             int block = (int)a2;
-            int rc = msg_receive(&m, block);
+            int rc = syscall_msg_receive(&m, block);
             if (rc != 0) {
                 ret = (uint64_t)(int64_t)rc;
                 break;
@@ -159,7 +206,12 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3) {
                 break;
             }
             struct msg m;
-            if (msg_receive(&m, 1) != 0 || m.type != MSG_TYPE_PONG) {
+            int rc = syscall_msg_receive(&m, 1);
+            if (rc != 0) {
+                ret = (uint64_t)(int64_t)rc;
+                break;
+            }
+            if (m.type != MSG_TYPE_PONG) {
                 ret = (uint64_t)-3;
                 break;
             }
@@ -279,6 +331,16 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3) {
     }
 
     lwkt_preempt_check();
+    return ret;
+}
+
+uint64_t syscall_post_dispatch(uint64_t ret) {
+    struct lwkt_thread *cur = lwkt_curthread();
+    if (cur && cur->runner_reswitch) {
+        cur->runner_reswitch = 0;
+        cur->in_syscall = 0;
+        runner_longjmp(&cur->runner_jmp, 1);
+    }
     if (cur) {
         cur->in_syscall = 0;
     }

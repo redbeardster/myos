@@ -78,7 +78,12 @@ static inline long myos_msg_ports(void) {
 }
 
 static inline long myos_msg_ping(void) {
-    return myos_syscall4(MYOS_SYS_MSG_PING, 0, 0, 0, 0);
+    for (;;) {
+        long ret = myos_syscall4(MYOS_SYS_MSG_PING, 0, 0, 0, 0);
+        if (ret != MYOS_ERR_AGAIN) {
+            return ret;
+        }
+    }
 }
 
 static inline long myos_thread_create(uintptr_t entry, uint64_t arg, long prio) {

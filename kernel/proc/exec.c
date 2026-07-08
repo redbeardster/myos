@@ -2,6 +2,7 @@
 
 #include "console.h"
 #include "elf.h"
+#include "lwkt.h"
 #include "memory.h"
 #include "myos_abi.h"
 #include "proc.h"
@@ -96,7 +97,7 @@ int exec_spawn_elf(const void *elf, size_t size, const char *name, uint32_t flag
     p->user_stack = user_rsp;
 
     uint32_t uthread_prio = LWKT_PRIO_NORMAL;
-    uint32_t runner_prio = is_shell ? LWKT_PRIO_HIGH : LWKT_PRIO_NORMAL;
+    uint32_t runner_prio = LWKT_PRIO_HIGH;
     struct uthread *u = uthread_spawn_in_proc(p, info.entry, user_rsp, 0, stack_base, uthread_prio);
     if (!u) {
         user_stack_free(p, stack_base);
@@ -109,6 +110,7 @@ int exec_spawn_elf(const void *elf, size_t size, const char *name, uint32_t flag
         return -8;
     }
 
+    lwkt_sched_ipi_others();
     return (int)p->pid;
 }
 

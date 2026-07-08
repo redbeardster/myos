@@ -5,6 +5,7 @@
 #include "memory.h"
 #include "myos_abi.h"
 #include "proc.h"
+#include "uthread.h"
 #include "vmm.h"
 
 #include <stdint.h>
@@ -88,15 +89,15 @@ void user_stack_free(struct proc *p, uint64_t stack_base) {
 }
 
 extern void user_enter_asm(uint64_t rip, uint64_t rsp, uint64_t arg,
-                           uint64_t *save_kernel_rsp, uint64_t user_rax);
+                           uint64_t *save_kernel_rsp, uint64_t user_rax,
+                           struct uthread *u) __attribute__((noreturn));
 
 void user_enter(uint64_t rip, uint64_t rsp, uint64_t arg, uint64_t user_rax,
-                uint64_t *save_kernel_rsp) {
+                uint64_t *save_kernel_rsp, struct uthread *u) {
     struct lwkt_thread *t = lwkt_curthread();
     if (t) {
-        uint64_t top = (uint64_t)(uintptr_t)t->stack + STACK_SIZE;
-        tss_set_rsp0(top & ~0xFULL);
+        tss_set_rsp0(lwkt_thread_syscall_rsp0(t));
     }
 
-    user_enter_asm(rip, rsp, arg, save_kernel_rsp, user_rax);
+    user_enter_asm(rip, rsp, arg, save_kernel_rsp, user_rax, u);
 }

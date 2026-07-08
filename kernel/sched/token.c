@@ -84,6 +84,10 @@ int token_trylock(struct token *t) {
 
     spin_lock(&t->guard);
     if (t->holder) {
+        if (t->holder == self) {
+            spin_unlock(&t->guard);
+            return 1;
+        }
         spin_unlock(&t->guard);
         return 0;
     }

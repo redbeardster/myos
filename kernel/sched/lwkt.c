@@ -44,25 +44,17 @@ static void enqueue_on_cpu(struct cpu *cpu, struct lwkt_thread *t) {
     t->next = NULL;
     t->run_cpu = cpu->id;
 
-    if (!cpu->run_queues[p]) {
-        cpu->run_queues[p] = t;
-        return;
+    struct lwkt_thread **slot = &cpu->run_queues[p];
+    while (*slot) {
+        slot = &(*slot)->next;
     }
-
-    struct lwkt_thread *tail = cpu->run_queues[p];
-    int guard = 0;
-    while (tail->next && guard < MAX_THREADS) {
-        tail = tail->next;
-        guard++;
-    }
-    if (guard >= MAX_THREADS) {
-        tail->next = NULL;
-    }
-    tail->next = t;
+    *slot = t;
 }
 
+static struct cpu *pick_enqueue_cpu(void);
+
 static void enqueue_thread(struct lwkt_thread *t) {
-    struct cpu *cpu = this_cpu();
+    struct cpu *cpu = pick_enqueue_cpu();
     if (!cpu) {
         cpu = cpu_by_id(0);
     }
@@ -181,12 +173,68 @@ static int cpu_has_ready_excluding_idle(struct cpu *cpu) {
             if (t == &cpu->idle) {
                 continue;
             }
+            if (t->state == THREAD_READY || t->state == THREAD_RUNNING) {
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+static int cpu_has_ready_peer(struct cpu *cpu) {
+    if (!cpu) {
+        return 0;
+    }
+    for (uint32_t p = 0; p < MAX_PRIORITY; p++) {
+        for (struct lwkt_thread *t = cpu->run_queues[p]; t; t = t->next) {
+            if (t == &cpu->idle) {
+                continue;
+            }
             if (t->state == THREAD_READY) {
                 return 1;
             }
         }
     }
     return 0;
+}
+
+static int any_cpu_has_ready_user_runner(void) {
+    for (uint32_t i = 0; i < cpu_online_count(); i++) {
+        struct cpu *c = cpu_by_id(i);
+        if (!c || !c->online) {
+            continue;
+        }
+        for (uint32_t p = 0; p < MAX_PRIORITY; p++) {
+            for (struct lwkt_thread *t = c->run_queues[p]; t; t = t->next) {
+                if (t == &c->idle) {
+                    continue;
+                }
+                if (t->state == THREAD_READY && t->user_proc) {
+                    return 1;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+static struct cpu *pick_enqueue_cpu(void) {
+    struct cpu *cpu = this_cpu();
+    if (!cpu) {
+        return cpu_by_id(0);
+    }
+
+    struct lwkt_thread *cur = cpu->current;
+    if (cur && cur->in_syscall) {
+        uint32_t n = cpu_online_count();
+        for (uint32_t i = 1; i < n; i++) {
+            struct cpu *other = cpu_by_id((cpu->id + i) % n);
+            if (other && other->online) {
+                return other;
+            }
+        }
+    }
+    return cpu;
 }
 
 static void strcpy_local(char *dst, const char *src) {
@@ -301,7 +349,7 @@ static void idle_worker(void *arg) {
     for (;;) {
         struct cpu *cpu = this_cpu();
         lwkt_preempt_check();
-        if (cpu_has_ready_excluding_idle(cpu)) {
+        if (cpu_has_ready_peer(cpu) || any_cpu_has_ready_user_runner()) {
             lwkt_yield();
             continue;
         }
@@ -451,7 +499,9 @@ struct lwkt_thread *lwkt_create(const char *name, void (*entry)(void *), void *a
     t->yields = 0;
     t->saved_kernel_rsp = 0;
     t->runner_resume_rsp = 0;
+    t->runner_jmp.rsp = 0;
     t->in_syscall = 0;
+    t->runner_reswitch = 0;
     t->wait_next = NULL;
     t->mbox_wait_next = NULL;
     t->mbox_slot = (uint8_t)((t - thread_pool) + 1);
@@ -634,7 +684,28 @@ int lwkt_in_usersyscall(void) {
 }
 
 void lwkt_syscall_wait_edge(void) {
+    /*
+     * Never lwkt_yield() from here: int 0x80 runs on syscall_stack (TSS.RSP0).
+     * Do not IPI on every poll either — that wakes all APs in a tight loop
+     * while shell waits for keyboard and can starve the BSP.
+     */
     __asm__ volatile("sti; hlt" ::: "memory");
+}
+
+int lwkt_syscall_resched(int64_t retry_ret) {
+    if (!lwkt_in_usersyscall()) {
+        return 0;
+    }
+    struct lwkt_thread *cur = lwkt_curthread();
+    if (cur && cur->runner_reswitch) {
+        return 1;
+    }
+    struct uthread *u = uthread_current();
+    if (u) {
+        u->user_syscall_ret = (uint64_t)retry_ret;
+    }
+    lwkt_syscall_wait_edge();
+    return 1;
 }
 
 int lwkt_thread_count(void) {
@@ -651,8 +722,7 @@ static void lwkt_apply_tss(struct lwkt_thread *t) {
         return;
     }
     if (t->user_proc || (t->uthread && t->uthread->type == UTHREAD_USER)) {
-        uint64_t top = (uint64_t)(uintptr_t)t->stack + STACK_SIZE;
-        tss_set_rsp0(top & ~0xFULL);
+        tss_set_rsp0(lwkt_thread_syscall_rsp0(t));
     }
 }
 

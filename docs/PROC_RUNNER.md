@@ -62,7 +62,7 @@ ps         # Uthreads count
 | `kernel/sched/kbdd.c` | poll клавиатуры из syscall (без msg wait) |
 | `kernel/sched/lwkt.c` | idle SMP, `lwkt_block` в syscall, preempt guards |
 | `kernel/syscall/syscall.c` | `in_syscall`, `uthread_yield` для `SYS_YIELD` |
-| `user/myos.h` | `myos_thread_join` / `myos_mutex_lock` — цикл на `MYOS_ERR_AGAIN` |
+| `user/myos.h` | `myos_thread_join` / `myos_mutex_lock` / `myos_msg_ping` — цикл на `MYOS_ERR_AGAIN` |
 
 ---
 
@@ -89,12 +89,12 @@ proc_runner_entry:
 
 ```
 uthread_yield():
-  syscall_frame_user_rip_rsp_get → сохранить в uthread
+  user RIP/RSP/RDI уже сохранены на входе в syscall (isr.asm → syscall_dispatch)
   cur → RUNNABLE, proc_sched_enqueue
   next = proc_sched_pick_other(p, cur)
   если next == NULL → lwkt_syscall_wait_edge(); return
   runner->in_syscall = 0
-  uthread_return_to_runner()    # ret на runner_resume_rsp
+  uthread_return_to_runner()    # ret на saved_kernel_rsp (после user_enter)
 ```
 
 ### Join / mutex из userland
@@ -132,6 +132,23 @@ if (lwkt_in_usersyscall()) {
 ```
 
 Иначе `msg_receive` / `token_lock` крутят busy-loop (100% CPU).
+
+### 4.5. Единый retry-путь для блокирующих syscall (7b)
+
+Добавлен helper:
+
+```c
+int lwkt_syscall_resched(int64_t retry_ret);
+```
+
+- работает только в `lwkt_in_usersyscall()`;
+- пишет `current_uthread->user_syscall_ret = retry_ret`;
+- делает `lwkt_syscall_wait_edge()` (`sti; hlt`) и возвращает `1`.
+
+Использование:
+
+- `uthread_join` и `proc_mutex_lock` для `MYOS_ERR_AGAIN`;
+- `SYS_MSG_RECV`/`SYS_MSG_PING`: в syscall runner делается `msg_receive(..., 0)` + retry через `MYOS_ERR_AGAIN`, без block-loop в `msg_receive(..., 1)`.
 
 ### 4.3. Клавиатура (`SYS_READ`)
 
@@ -217,7 +234,7 @@ In-proc pick: **меньше число = выше приоритет** (как 
 
 ## 8. Известные ограничения
 
-- **Msgport из syscall** (ping, msg send+block recv): runner не отдаёт CPU kbdd/msgd через `lwkt_block`; для block нужен poll+`wait_edge` или отдельный resched (см. §4.3 для kbdd).
+- **Msgport из syscall**: для блокирующего recv обязателен retry-протокол (`MYOS_ERR_AGAIN`) в userland-обёртках; прямой single-shot `SYS_MSG_RECV(block=1)` в приложении без retry может зависнуть по ожиданиям API.
 - **Preempt runner в user mode** без сохранения uthread state — отключён в `lwkt_preempt_check`.
 - **Максимум:** `MAX_THREADS` LWKT, `MAX_PROCS` proc, `STACK_SIZE` 4 KiB на LWKT.
 
@@ -225,5 +242,6 @@ In-proc pick: **меньше число = выше приоритет** (как 
 
 ## 9. Ссылки
 
+- [ARCHITECTURE_AUDIT.md](ARCHITECTURE_AUDIT.md) — полный аудит, история багов, инварианты
 - DragonFly (референс, не копировать): `sys/kern/usched_dfly.c`, token sleep
 - Локально: `/home/redbeard/dsk_250/DragonFlyBSD` (если доступен)

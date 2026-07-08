@@ -73,7 +73,7 @@ static void send_char_to(uint32_t client_id, char c) {
 
 static void kbdd_drain_scancodes(void) {
     uint8_t sc;
-    while (keyboard_pop_scancode(&sc)) {
+    while (keyboard_pop_scancode(&sc) || keyboard_poll_scancode(&sc)) {
         char c = keyboard_translate_scancode(sc);
         if (c == 0) {
             continue;

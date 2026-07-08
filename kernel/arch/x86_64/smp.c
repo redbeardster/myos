@@ -6,12 +6,14 @@
 #include "lapic.h"
 #include "lwkt.h"
 #include "smp.h"
+#include "spinlock.h"
 
 #include <limine.h>
 #include <stdint.h>
 
 static struct cpu cpus[MAX_CPUS];
 static uint32_t cpu_count;
+static spinlock_t cpu_list_lock;
 static volatile int aps_waiting;
 static volatile int smp_go;
 
@@ -28,14 +30,21 @@ struct cpu *cpu_current(void) {
 }
 
 struct cpu *cpu_by_id(uint32_t id) {
-    if (id >= cpu_count) {
-        return NULL;
+    struct cpu *cpu = NULL;
+    spin_lock(&cpu_list_lock);
+    if (id < cpu_count) {
+        cpu = &cpus[id];
     }
-    return &cpus[id];
+    spin_unlock(&cpu_list_lock);
+    return cpu;
 }
 
 uint32_t cpu_online_count(void) {
-    return cpu_count;
+    uint32_t n;
+    spin_lock(&cpu_list_lock);
+    n = cpu_count;
+    spin_unlock(&cpu_list_lock);
+    return n;
 }
 
 int cpu_is_bsp(void) {
@@ -47,11 +56,15 @@ int cpu_index_of_thread(struct lwkt_thread *t) {
     if (!t) {
         return -1;
     }
-    for (uint32_t i = 0; i < cpu_count; i++) {
+    spin_lock(&cpu_list_lock);
+    uint32_t ncpu = cpu_count;
+    for (uint32_t i = 0; i < ncpu; i++) {
         if (cpus[i].current == t) {
+            spin_unlock(&cpu_list_lock);
             return (int)i;
         }
     }
+    spin_unlock(&cpu_list_lock);
     return -1;
 }
 
@@ -64,13 +77,16 @@ void cpu_set_gs(struct cpu *cpu) {
 }
 
 static struct cpu *cpu_alloc(uint32_t lapic_id, int bsp) {
-    if (cpu_count >= MAX_CPUS) {
+    spin_lock(&cpu_list_lock);
+    uint32_t idx = cpu_count;
+    if (idx >= MAX_CPUS) {
+        spin_unlock(&cpu_list_lock);
         return NULL;
     }
 
-    struct cpu *c = &cpus[cpu_count++];
+    struct cpu *c = &cpus[idx];
     c->self = c;
-    c->id = cpu_count - 1;
+    c->id = idx;
     c->lapic_id = lapic_id;
     c->online = 1;
     c->bsp = bsp;
@@ -82,10 +98,13 @@ static struct cpu *cpu_alloc(uint32_t lapic_id, int bsp) {
     for (int i = 0; i < MAX_PRIORITY; i++) {
         c->run_queues[i] = NULL;
     }
+    cpu_count = idx + 1;
+    spin_unlock(&cpu_list_lock);
     return c;
 }
 
 void cpu_init_bsp(void) {
+    spin_init(&cpu_list_lock);
     cpu_count = 0;
     aps_waiting = 0;
     smp_go = 0;
@@ -198,8 +217,12 @@ void cpu_list(void) {
     console_writestring("\nCPU  Lapic  BSP  Sched  Switches  Current thread\n");
     console_writestring("---  -----  ---  -----  --------  --------------\n");
 
-    for (uint32_t i = 0; i < cpu_count; i++) {
-        struct cpu *c = &cpus[i];
+    uint32_t ncpu = cpu_online_count();
+    for (uint32_t i = 0; i < ncpu; i++) {
+        struct cpu *c = cpu_by_id(i);
+        if (!c) {
+            continue;
+        }
         console_write_dec(c->id);
         console_writestring("    ");
         console_write_dec(c->lapic_id);
@@ -228,6 +251,6 @@ void cpu_list(void) {
     }
 
     console_writestring("\n");
-    console_write_dec(cpu_count);
+    console_write_dec(ncpu);
     console_writestring(" CPU(s) online\n");
 }
