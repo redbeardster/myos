@@ -377,6 +377,58 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
             ret = (uint64_t)(int64_t)lwkt_ipc_bump_mode((int)a1);
             break;
 
+        case SYS_CAP_CREATE_PORT:
+            ret = (uint64_t)(int64_t)proc_cap_create_port();
+            break;
+
+        case SYS_CAP_SEND: {
+            char tmp[MSG_MAX_PAYLOAD];
+            uint64_t len = a3;
+            if (len > MSG_MAX_PAYLOAD) {
+                ret = (uint64_t)-2;
+                break;
+            }
+            if (len > 0) {
+                if (copy_from_user_safe(tmp, (const char *)(uintptr_t)a2, len) != 0) {
+                    ret = (uint64_t)-1;
+                    break;
+                }
+            }
+            ret = (uint64_t)(int64_t)proc_cap_send((uint32_t)a1, MSG_TYPE_DATA, tmp,
+                                                   (uint32_t)len);
+            break;
+        }
+
+        case SYS_CAP_RECV: {
+            struct msg m;
+            int block = (int)a3;
+            int rc = proc_cap_recv((uint32_t)a1, &m, block);
+            if (rc != 0) {
+                ret = (uint64_t)(int64_t)rc;
+                break;
+            }
+            if (a2) {
+                struct msg *out = (struct msg *)(uintptr_t)a2;
+                *out = m;
+            }
+            ret = 0;
+            break;
+        }
+
+        case SYS_CAP_GRANT:
+            ret = (uint64_t)(int64_t)proc_cap_grant((uint32_t)a1, (uint32_t)a2, (uint32_t)a3);
+            break;
+
+        case SYS_CAP_CLOSE:
+            ret = (uint64_t)(int64_t)proc_cap_close((uint32_t)a1);
+            break;
+
+        case SYS_GETPID: {
+            struct proc *p = proc_current();
+            ret = p ? (uint64_t)p->pid : 0;
+            break;
+        }
+
         default:
             ret = (uint64_t)-1;
             break;

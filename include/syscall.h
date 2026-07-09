@@ -27,6 +27,12 @@
 #define SYS_PORT_LOOKUP   MYOS_SYS_PORT_LOOKUP
 #define SYS_MSG_PORTS     MYOS_SYS_MSG_PORTS
 #define SYS_IPC_BUMP_MODE MYOS_SYS_IPC_BUMP_MODE
+#define SYS_CAP_CREATE_PORT MYOS_SYS_CAP_CREATE_PORT
+#define SYS_CAP_SEND        MYOS_SYS_CAP_SEND
+#define SYS_CAP_RECV        MYOS_SYS_CAP_RECV
+#define SYS_CAP_GRANT       MYOS_SYS_CAP_GRANT
+#define SYS_CAP_CLOSE       MYOS_SYS_CAP_CLOSE
+#define SYS_GETPID          MYOS_SYS_GETPID
 
 void syscall_init(void);
 uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,

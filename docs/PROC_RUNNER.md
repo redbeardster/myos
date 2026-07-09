@@ -237,6 +237,8 @@ In-proc pick: **меньше число = выше приоритет** (как 
 - [ ] После exit: shell отвечает, `ps` — один процесс
 - [ ] `threads` — `p1` runner, без лишних `uN` на user uthread
 - [ ] `exec threads.elf` на **8 CPU** без GPF / зависания
+- [ ] `capdiag stress 1000` — `fail=0`, shell остаётся интерактивным
+- [ ] `capdiag grantstress 1000` — `fail=0`, `uthreads/cpus` после теста стабильны
 
 ---
 
@@ -245,6 +247,15 @@ In-proc pick: **меньше число = выше приоритет** (как 
 - **Msgport из syscall**: для блокирующего recv обязателен retry-протокол (`MYOS_ERR_AGAIN`) в userland-обёртках; прямой single-shot `SYS_MSG_RECV(block=1)` в приложении без retry может зависнуть по ожиданиям API.
 - **Preempt runner в user mode** без сохранения uthread state — отключён в `lwkt_preempt_check`.
 - **Максимум:** `MAX_THREADS` LWKT, `MAX_PROCS` proc, `STACK_SIZE` 8 KiB на LWKT.
+
+### 8.1. Capability IPC диагностика (MVP)
+
+- Добавлены syscall: `CAP_CREATE_PORT`, `CAP_SEND`, `CAP_RECV`, `CAP_GRANT`, `CAP_CLOSE`, `GETPID`.
+- Shell-диагностика:
+  - `capdiag` — одиночный проход с проверкой data-path и negative-path.
+  - `capdiag stress N` — циклический self-cap тест (create/send/recv/close).
+  - `capdiag grantstress N` — циклический grant-path (create/grant/send/recv/close).
+- Критичный инвариант: каждый раунд обязан закрывать созданные cap-слоты (`capclose`), иначе после `MYOS_CAP_MAX` раундов будет `create rc=-1` (исчерпание таблицы), что не является SMP race.
 
 ---
 

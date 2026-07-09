@@ -253,6 +253,7 @@ shell на CPU 0: READ + hlt (RUNNING, in_syscall=1)
 | C3 | Hang после `cpus` | IPI storm + idle spin на msgd READY | только `user_proc` runners; без IPI в wait |
 | C5 | `ping` зависал (`msgd` READY) | starvation: shell prio 2 вытеснял msgd prio 8 | жёсткий квант + IPC bump + post-syscall yield |
 | C4 | Битый `current_uthread` | запись по невалидному указателю | `uthread_ptr_valid()` |
+| C6 | `capdiag stress` деградировал после ~32 раундов | cap-слоты не закрывались, исчерпание `MYOS_CAP_MAX` | `CAP_CLOSE` + auto-close в `capdiag`/`capsmoke` |
 
 ### Хронология симптомов
 
@@ -296,6 +297,8 @@ make run    # SMP=8 в Makefile
 | 6 | `ping`, `msg msgd hello` | стабильно, без hang |
 | 7 | несколько команд подряд | нет hang / GPF |
 | 8 | htop на хосте | QEMU ~0–15% в idle |
+| 9 | `capdiag stress 1000` | `fail=0`, shell активен |
+| 10 | `capdiag grantstress 1000` | `fail=0`, `uthreads/cpus` стабильны |
 
 ### Инварианты — не ломать
 

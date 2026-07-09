@@ -16,6 +16,18 @@ static struct proc proc_table[MAX_PROCS];
 static uint32_t next_pid = 1;
 static spinlock_t proc_table_lock;
 
+static int proc_alloc_cap_slot(struct proc *p) {
+    if (!p) {
+        return -1;
+    }
+    for (uint32_t i = 0; i < MYOS_CAP_MAX; i++) {
+        if (!p->caps[i].in_use) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
 static void strcpy_local(char *dst, const char *src) {
     while (*src) {
         *dst++ = *src++;
@@ -74,6 +86,11 @@ static void proc_reset_slot(struct proc *p) {
     p->current_uthread = NULL;
     p->run_queue = NULL;
     proc_mutex_init_all(p->mutexes, PROC_MUTEX_MAX);
+    for (uint32_t i = 0; i < MYOS_CAP_MAX; i++) {
+        p->caps[i].in_use = 0;
+        p->caps[i].target_lwkt_id = 0;
+        p->caps[i].rights = 0;
+    }
 }
 
 static const char *state_name(enum proc_state state) {
@@ -336,6 +353,127 @@ int proc_mutex_unlock(uint32_t id) {
         return -1;
     }
     return proc_mutex_unlock_slot(p->mutexes, PROC_MUTEX_MAX, id);
+}
+
+int proc_cap_create_port(void) {
+    struct proc *p = proc_current();
+    struct lwkt_thread *cur = lwkt_curthread();
+    if (!p || !cur || cur->id == 0) {
+        return -1;
+    }
+
+    uint64_t irqf;
+    spin_lock_irqsave(&proc_table_lock, &irqf);
+    int slot = proc_alloc_cap_slot(p);
+    if (slot >= 0) {
+        p->caps[slot].in_use = 1;
+        p->caps[slot].target_lwkt_id = cur->id;
+        p->caps[slot].rights = MYOS_CAP_RIGHT_SEND | MYOS_CAP_RIGHT_RECV;
+    }
+    spin_unlock_irqrestore(&proc_table_lock, irqf);
+    return slot;
+}
+
+int proc_cap_send(uint32_t cap_slot, uint32_t type, const void *data, uint32_t size) {
+    struct proc *p = proc_current();
+    if (!p || cap_slot >= MYOS_CAP_MAX) {
+        return -1;
+    }
+
+    uint32_t target = 0;
+    uint64_t irqf;
+    spin_lock_irqsave(&proc_table_lock, &irqf);
+    struct cap_entry *c = &p->caps[cap_slot];
+    if (!c->in_use || (c->rights & MYOS_CAP_RIGHT_SEND) == 0) {
+        spin_unlock_irqrestore(&proc_table_lock, irqf);
+        return -2;
+    }
+    target = c->target_lwkt_id;
+    spin_unlock_irqrestore(&proc_table_lock, irqf);
+
+    return msg_send(target, type, data, size);
+}
+
+int proc_cap_recv(uint32_t cap_slot, struct msg *out, int block) {
+    struct proc *p = proc_current();
+    struct lwkt_thread *cur = lwkt_curthread();
+    if (!p || !cur || cap_slot >= MYOS_CAP_MAX) {
+        return -1;
+    }
+
+    uint32_t target = 0;
+    uint64_t irqf;
+    spin_lock_irqsave(&proc_table_lock, &irqf);
+    struct cap_entry *c = &p->caps[cap_slot];
+    if (!c->in_use || (c->rights & MYOS_CAP_RIGHT_RECV) == 0) {
+        spin_unlock_irqrestore(&proc_table_lock, irqf);
+        return -2;
+    }
+    target = c->target_lwkt_id;
+    spin_unlock_irqrestore(&proc_table_lock, irqf);
+
+    if (target != cur->id) {
+        return -3;
+    }
+    return msg_receive(out, block);
+}
+
+int proc_cap_grant(uint32_t cap_slot, uint32_t target_pid, uint32_t rights) {
+    struct proc *p = proc_current();
+    if (!p || cap_slot >= MYOS_CAP_MAX || target_pid == 0) {
+        return -1;
+    }
+    rights &= (MYOS_CAP_RIGHT_SEND | MYOS_CAP_RIGHT_RECV);
+    if (rights == 0) {
+        return -2;
+    }
+
+    uint64_t irqf;
+    spin_lock_irqsave(&proc_table_lock, &irqf);
+    struct cap_entry *src = &p->caps[cap_slot];
+    if (!src->in_use) {
+        spin_unlock_irqrestore(&proc_table_lock, irqf);
+        return -3;
+    }
+    if ((src->rights & rights) != rights) {
+        spin_unlock_irqrestore(&proc_table_lock, irqf);
+        return -4;
+    }
+    struct proc *dst = find_proc(target_pid);
+    if (!dst || dst->state != PROC_RUNNING) {
+        spin_unlock_irqrestore(&proc_table_lock, irqf);
+        return -5;
+    }
+    int dst_slot = proc_alloc_cap_slot(dst);
+    if (dst_slot < 0) {
+        spin_unlock_irqrestore(&proc_table_lock, irqf);
+        return -6;
+    }
+    dst->caps[dst_slot].in_use = 1;
+    dst->caps[dst_slot].target_lwkt_id = src->target_lwkt_id;
+    dst->caps[dst_slot].rights = rights;
+    spin_unlock_irqrestore(&proc_table_lock, irqf);
+    return dst_slot;
+}
+
+int proc_cap_close(uint32_t cap_slot) {
+    struct proc *p = proc_current();
+    if (!p || cap_slot >= MYOS_CAP_MAX) {
+        return -1;
+    }
+
+    uint64_t irqf;
+    spin_lock_irqsave(&proc_table_lock, &irqf);
+    struct cap_entry *c = &p->caps[cap_slot];
+    if (!c->in_use) {
+        spin_unlock_irqrestore(&proc_table_lock, irqf);
+        return -2;
+    }
+    c->in_use = 0;
+    c->target_lwkt_id = 0;
+    c->rights = 0;
+    spin_unlock_irqrestore(&proc_table_lock, irqf);
+    return 0;
 }
 
 void proc_init(void) {

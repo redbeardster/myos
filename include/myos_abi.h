@@ -41,6 +41,12 @@
 #define MYOS_SYS_PORT_LOOKUP   20
 #define MYOS_SYS_MSG_PORTS     21
 #define MYOS_SYS_IPC_BUMP_MODE 22
+#define MYOS_SYS_CAP_CREATE_PORT 23
+#define MYOS_SYS_CAP_SEND        24
+#define MYOS_SYS_CAP_RECV        25
+#define MYOS_SYS_CAP_GRANT       26
+#define MYOS_SYS_CAP_CLOSE       27
+#define MYOS_SYS_GETPID          28
 
 #define MYOS_PROC_MUTEX_MAX    8
 
@@ -55,5 +61,9 @@
 
 #define MYOS_MSG_PING_SEND  1
 #define MYOS_MSG_PING_SILENT 2
+
+#define MYOS_CAP_MAX 32
+#define MYOS_CAP_RIGHT_SEND 0x1
+#define MYOS_CAP_RIGHT_RECV 0x2
 
 #endif

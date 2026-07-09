@@ -6,6 +6,13 @@
 
 typedef long myos_ssize_t;
 
+struct myos_msg {
+    uint32_t from;
+    uint32_t type;
+    uint32_t size;
+    uint8_t data[64];
+};
+
 static inline long myos_syscall4(long num, long a1, long a2, long a3, long a4) {
     long ret;
     __asm__ volatile(
@@ -126,6 +133,30 @@ static inline long myos_mutex_unlock(unsigned long id) {
 
 static inline long myos_cpus(void) {
     return myos_syscall4(MYOS_SYS_CPUS, 0, 0, 0, 0);
+}
+
+static inline long myos_cap_create_port(void) {
+    return myos_syscall4(MYOS_SYS_CAP_CREATE_PORT, 0, 0, 0, 0);
+}
+
+static inline long myos_cap_send(long cap_slot, const void *buf, unsigned long len) {
+    return myos_syscall4(MYOS_SYS_CAP_SEND, cap_slot, (long)(uintptr_t)buf, (long)len, 0);
+}
+
+static inline long myos_cap_recv(long cap_slot, struct myos_msg *out, long block) {
+    return myos_syscall4(MYOS_SYS_CAP_RECV, cap_slot, (long)(uintptr_t)out, block, 0);
+}
+
+static inline long myos_cap_grant(long cap_slot, long target_pid, long rights_mask) {
+    return myos_syscall4(MYOS_SYS_CAP_GRANT, cap_slot, target_pid, rights_mask, 0);
+}
+
+static inline long myos_cap_close(long cap_slot) {
+    return myos_syscall4(MYOS_SYS_CAP_CLOSE, cap_slot, 0, 0, 0);
+}
+
+static inline long myos_getpid(void) {
+    return myos_syscall4(MYOS_SYS_GETPID, 0, 0, 0, 0);
 }
 
 #endif

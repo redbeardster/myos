@@ -78,6 +78,15 @@ static void write_prompt(void) {
     write_str("\nMyOS> ");
 }
 
+static void write_rc(long rc) {
+    if (rc < 0) {
+        write_str("-");
+        write_dec((unsigned long)(0 - rc));
+    } else {
+        write_dec((unsigned long)rc);
+    }
+}
+
 static int read_line(char *buf, int max) {
     int i = 0;
     while (i < max - 1) {
@@ -126,6 +135,15 @@ static void cmd_help(void) {
     write_str("  ipcmode [on/off]- toggle IPC receiver bump\n");
     write_str("  pingbench [N]   - run N ping calls\n");
     write_str("  pingbench_ab [N]- compare ping with bump off/on\n");
+    write_str("  capsmoke        - capability self-send/recv test\n");
+    write_str("  capnew          - create local capability slot\n");
+    write_str("  capsend S text  - send text via cap slot S\n");
+    write_str("  caprecv S [b]   - recv via cap slot S (b=1 block)\n");
+    write_str("  capgrant S P R  - grant slot S to pid P with rights R\n");
+    write_str("  capclose S      - close/free cap slot S\n");
+    write_str("  capdiag         - run capability diagnostics\n");
+    write_str("  capdiag stress N- run diagnostics N times\n");
+    write_str("  capdiag grantstress N - stress grant path\n");
     write_str("  yield           - syscall yield test\n");
 }
 
@@ -228,6 +246,423 @@ static void run_command(char *line) {
         write_dec(ok);
         write_str(" total=");
         write_dec(n);
+        write_str("\n");
+        return;
+    }
+
+    if (str_eq(line, "capsmoke")) {
+        long cap = myos_cap_create_port();
+        if (cap < 0) {
+            write_str("\ncapsmoke: create failed\n");
+            return;
+        }
+
+        const char *payload = "cap-ok";
+        if (myos_cap_send(cap, payload, 6) != 0) {
+            write_str("\ncapsmoke: send failed\n");
+            return;
+        }
+
+        struct myos_msg m;
+        if (myos_cap_recv(cap, &m, 0) != 0) {
+            write_str("\ncapsmoke: recv failed\n");
+            return;
+        }
+        myos_cap_close(cap);
+        write_str("\ncapsmoke: ok cap=");
+        write_dec((unsigned long)cap);
+        write_str("\n");
+        return;
+    }
+
+    if (str_eq(line, "capdiag") || str_starts(line, "capdiag stress ") ||
+        str_starts(line, "capdiag grantstress ")) {
+        unsigned long rounds = 1;
+        int grantstress = 0;
+        if (str_starts(line, "capdiag stress ")) {
+            const char *arg = line + 15;
+            skip_spaces(&arg);
+            if (parse_u32(arg, &rounds) != 0 || rounds == 0) {
+                write_str("\nusage: capdiag stress <N>\n");
+                return;
+            }
+        } else if (str_starts(line, "capdiag grantstress ")) {
+            const char *arg = line + 20;
+            skip_spaces(&arg);
+            if (parse_u32(arg, &rounds) != 0 || rounds == 0) {
+                write_str("\nusage: capdiag grantstress <N>\n");
+                return;
+            }
+            grantstress = 1;
+        }
+
+        unsigned long pass = 0;
+        unsigned long fail = 0;
+
+        write_str("\n[capdiag] start rounds=");
+        write_dec(rounds);
+        write_str("\n");
+
+        for (unsigned long r = 0; r < rounds; r++) {
+            if (rounds > 1) {
+                write_str("[round ");
+                write_dec(r + 1);
+                write_str("]\n");
+            }
+
+            long cap = myos_cap_create_port();
+            if (cap >= 0) {
+                if (rounds == 1) {
+                    write_str("[PASS] create slot=");
+                    write_dec((unsigned long)cap);
+                    write_str("\n");
+                }
+                pass++;
+            } else {
+                write_str("[FAIL] create rc=");
+                write_rc(cap);
+                write_str("\n");
+                fail++;
+            }
+
+            if (cap >= 0) {
+                long active_slot = cap;
+                long granted_slot = -1;
+
+                if (grantstress) {
+                    long self_pid = myos_getpid();
+                    if (self_pid <= 0) {
+                        write_str("[FAIL] getpid rc=");
+                        write_rc(self_pid);
+                        write_str("\n");
+                        fail++;
+                    } else {
+                        granted_slot = myos_cap_grant(cap, self_pid,
+                            MYOS_CAP_RIGHT_SEND | MYOS_CAP_RIGHT_RECV);
+                        if (granted_slot >= 0) {
+                            if (rounds == 1) {
+                                write_str("[PASS] grant-self slot=");
+                                write_dec((unsigned long)granted_slot);
+                                write_str("\n");
+                            }
+                            pass++;
+                            active_slot = granted_slot;
+                        } else {
+                            write_str("[FAIL] grant-self rc=");
+                            write_rc(granted_slot);
+                            write_str("\n");
+                            fail++;
+                        }
+                    }
+                }
+
+                const char *payload = "diag";
+                long rc_send = myos_cap_send(active_slot, payload, 4);
+                if (rc_send == 0) {
+                    if (rounds == 1) {
+                        write_str("[PASS] send rc=0\n");
+                    }
+                    pass++;
+                } else {
+                    write_str("[FAIL] send rc=");
+                    write_rc(rc_send);
+                    write_str("\n");
+                    fail++;
+                }
+
+                struct myos_msg m;
+                long rc_recv = myos_cap_recv(active_slot, &m, 0);
+                if (rc_recv == 0 && m.size == 4 &&
+                    m.data[0] == 'd' && m.data[1] == 'i' &&
+                    m.data[2] == 'a' && m.data[3] == 'g') {
+                    if (rounds == 1) {
+                        write_str("[PASS] recv data=\"diag\"\n");
+                    }
+                    pass++;
+                } else {
+                    write_str("[FAIL] recv rc=");
+                    write_rc(rc_recv);
+                    write_str(" size=");
+                    write_dec((unsigned long)m.size);
+                    write_str("\n");
+                    fail++;
+                }
+
+                long rc_recv_empty = myos_cap_recv(active_slot, &m, 0);
+                if (rc_recv_empty == 1) {
+                    if (rounds == 1) {
+                        write_str("[PASS] recv-empty rc=1\n");
+                    }
+                    pass++;
+                } else {
+                    write_str("[FAIL] recv-empty rc=");
+                    write_rc(rc_recv_empty);
+                    write_str("\n");
+                    fail++;
+                }
+
+                long rc_bad_grant = myos_cap_grant(cap, 999, 1);
+                if (rc_bad_grant < 0) {
+                    if (rounds == 1) {
+                        write_str("[PASS] bad-grant rc=");
+                        write_rc(rc_bad_grant);
+                        write_str("\n");
+                    }
+                    pass++;
+                } else {
+                    write_str("[FAIL] bad-grant rc=");
+                    write_rc(rc_bad_grant);
+                    write_str("\n");
+                    fail++;
+                }
+
+                if (granted_slot >= 0) {
+                    long rc_close_granted = myos_cap_close(granted_slot);
+                    if (rc_close_granted == 0) {
+                        if (rounds == 1) {
+                            write_str("[PASS] close-granted rc=0\n");
+                        }
+                        pass++;
+                    } else {
+                        write_str("[FAIL] close-granted rc=");
+                        write_rc(rc_close_granted);
+                        write_str("\n");
+                        fail++;
+                    }
+                }
+
+                long rc_close = myos_cap_close(cap);
+                if (rc_close == 0) {
+                    if (rounds == 1) {
+                        write_str("[PASS] close rc=0\n");
+                    }
+                    pass++;
+                } else {
+                    write_str("[FAIL] close rc=");
+                    write_rc(rc_close);
+                    write_str("\n");
+                    fail++;
+                }
+            }
+
+            long rc_bad_send = myos_cap_send(999, "x", 1);
+            if (rc_bad_send < 0) {
+                if (rounds == 1) {
+                    write_str("[PASS] bad-send rc=");
+                    write_rc(rc_bad_send);
+                    write_str("\n");
+                }
+                pass++;
+            } else {
+                write_str("[FAIL] bad-send rc=");
+                write_rc(rc_bad_send);
+                write_str("\n");
+                fail++;
+            }
+        }
+
+        write_str("[capdiag] done pass=");
+        write_dec(pass);
+        write_str(" fail=");
+        write_dec(fail);
+        write_str("\n");
+        return;
+    }
+
+    if (str_starts(line, "capclose ")) {
+        const char *arg = line + 9;
+        skip_spaces(&arg);
+        unsigned long slot = 0;
+        if (parse_u32(arg, &slot) != 0) {
+            write_str("\nusage: capclose <slot>\n");
+            return;
+        }
+        long rc = myos_cap_close((long)slot);
+        write_str("\ncapclose rc=");
+        write_rc(rc);
+        write_str("\n");
+        return;
+    }
+
+    if (str_eq(line, "capnew")) {
+        long cap = myos_cap_create_port();
+        if (cap < 0) {
+            write_str("\ncapnew failed rc=");
+            write_dec((unsigned long)(0 - cap));
+            write_str("\n");
+            return;
+        }
+        write_str("\ncapnew slot=");
+        write_dec((unsigned long)cap);
+        write_str("\n");
+        return;
+    }
+
+    if (str_starts(line, "capsend ")) {
+        const char *args = line + 8;
+        skip_spaces(&args);
+        const char *sp = args;
+        while (*sp && *sp != ' ') {
+            sp++;
+        }
+        if (*sp == '\0') {
+            write_str("\nusage: capsend <slot> <text>\n");
+            return;
+        }
+        char slot_buf[16];
+        int sl = (int)(sp - args);
+        if (sl <= 0 || sl >= 16) {
+            write_str("\nusage: capsend <slot> <text>\n");
+            return;
+        }
+        for (int i = 0; i < sl; i++) {
+            slot_buf[i] = args[i];
+        }
+        slot_buf[sl] = '\0';
+        unsigned long slot = 0;
+        if (parse_u32(slot_buf, &slot) != 0) {
+            write_str("\nusage: capsend <slot> <text>\n");
+            return;
+        }
+        const char *text = sp;
+        skip_spaces(&text);
+        if (*text == '\0') {
+            write_str("\nusage: capsend <slot> <text>\n");
+            return;
+        }
+        unsigned long len = str_len(text);
+        if (len > 60) {
+            len = 60;
+        }
+        long rc = myos_cap_send((long)slot, text, len);
+        write_str("\ncapsend rc=");
+        write_rc(rc);
+        write_str("\n");
+        return;
+    }
+
+    if (str_starts(line, "caprecv ")) {
+        const char *args = line + 8;
+        skip_spaces(&args);
+        const char *sp = args;
+        while (*sp && *sp != ' ') {
+            sp++;
+        }
+        char slot_buf[16];
+        int sl = (int)(sp - args);
+        if (sl <= 0 || sl >= 16) {
+            write_str("\nusage: caprecv <slot> [block]\n");
+            return;
+        }
+        for (int i = 0; i < sl; i++) {
+            slot_buf[i] = args[i];
+        }
+        slot_buf[sl] = '\0';
+        unsigned long slot = 0;
+        if (parse_u32(slot_buf, &slot) != 0) {
+            write_str("\nusage: caprecv <slot> [block]\n");
+            return;
+        }
+        long block = 0;
+        if (*sp) {
+            const char *b = sp;
+            skip_spaces(&b);
+            if (*b) {
+                unsigned long bv = 0;
+                if (parse_u32(b, &bv) != 0 || bv > 1) {
+                    write_str("\nusage: caprecv <slot> [block]\n");
+                    return;
+                }
+                block = (long)bv;
+            }
+        }
+
+        struct myos_msg m;
+        long rc = myos_cap_recv((long)slot, &m, block);
+        if (rc != 0) {
+            write_str("\ncaprecv rc=");
+            write_rc(rc);
+            write_str("\n");
+            return;
+        }
+
+        write_str("\ncaprecv ok from=");
+        write_dec((unsigned long)m.from);
+        write_str(" size=");
+        write_dec((unsigned long)m.size);
+        write_str(" data=\"");
+        unsigned long n = m.size;
+        if (n > 60) {
+            n = 60;
+        }
+        myos_write(1, m.data, n);
+        write_str("\"\n");
+        return;
+    }
+
+    if (str_starts(line, "capgrant ")) {
+        const char *args = line + 9;
+        skip_spaces(&args);
+
+        const char *p1 = args;
+        while (*p1 && *p1 != ' ') {
+            p1++;
+        }
+        if (*p1 == '\0') {
+            write_str("\nusage: capgrant <slot> <pid> <rights>\n");
+            return;
+        }
+        char b1[16];
+        int n1 = (int)(p1 - args);
+        if (n1 <= 0 || n1 >= 16) {
+            write_str("\nusage: capgrant <slot> <pid> <rights>\n");
+            return;
+        }
+        for (int i = 0; i < n1; i++) b1[i] = args[i];
+        b1[n1] = '\0';
+
+        const char *p2 = p1;
+        skip_spaces(&p2);
+        const char *p3 = p2;
+        while (*p3 && *p3 != ' ') {
+            p3++;
+        }
+        if (*p3 == '\0') {
+            write_str("\nusage: capgrant <slot> <pid> <rights>\n");
+            return;
+        }
+        char b2[16];
+        int n2 = (int)(p3 - p2);
+        if (n2 <= 0 || n2 >= 16) {
+            write_str("\nusage: capgrant <slot> <pid> <rights>\n");
+            return;
+        }
+        for (int i = 0; i < n2; i++) b2[i] = p2[i];
+        b2[n2] = '\0';
+
+        const char *p4 = p3;
+        skip_spaces(&p4);
+        if (*p4 == '\0') {
+            write_str("\nusage: capgrant <slot> <pid> <rights>\n");
+            return;
+        }
+
+        unsigned long slot = 0, pid = 0, rights = 0;
+        if (parse_u32(b1, &slot) != 0 || parse_u32(b2, &pid) != 0 || parse_u32(p4, &rights) != 0) {
+            write_str("\nusage: capgrant <slot> <pid> <rights>\n");
+            return;
+        }
+
+        long rc = myos_cap_grant((long)slot, (long)pid, (long)rights);
+        if (rc < 0) {
+            write_str("\ncapgrant rc=");
+            write_str("-");
+            write_dec((unsigned long)(0 - rc));
+            write_str("\n");
+            return;
+        }
+        write_str("\ncapgrant new_slot=");
+        write_dec((unsigned long)rc);
         write_str("\n");
         return;
     }
