@@ -359,14 +359,20 @@ static void proc_runner_entry(void *arg) {
             lwkt_thread_exit();
         }
 
+        if (runner->pending_kill) {
+            runner->pending_kill = 0;
+            runner->in_syscall = 0;
+            p->current_uthread = NULL;
+            proc_destroy(p);
+            lwkt_thread_exit();
+        }
+
         if (resumed != 0) {
             runner->in_syscall = 0;
             p->current_uthread = NULL;
 
-            if (runner->pending_kill) {
-                runner->pending_kill = 0;
-                proc_destroy(p);
-                lwkt_thread_exit();
+            if (runner->runner_reswitch) {
+                runner->runner_reswitch = 0;
             }
         }
 
@@ -634,11 +640,20 @@ void uthread_yield(void) {
         return;
     }
 
+    if (runner->pending_kill) {
+        uthread_return_to_runner(p);
+        return;
+    }
+
     if (cur->state != UTHREAD_BLOCKED) {
         proc_sched_enqueue(p, cur);
     }
 
     if (!proc_sched_has_runnable_other(p, cur)) {
+        if (runner->pending_kill) {
+            uthread_return_to_runner(p);
+            return;
+        }
         if (lwkt_in_usersyscall()) {
             lwkt_syscall_wait_edge();
         }
@@ -783,9 +798,48 @@ static const char *uthread_state_name(enum uthread_state st) {
     }
 }
 
+static void write_padded(const char *s, int width) {
+    int n = 0;
+    if (!s) {
+        s = "-";
+    }
+    while (s[n] && n < width) {
+        console_putchar(s[n]);
+        n++;
+    }
+    while (n < width) {
+        console_putchar(' ');
+        n++;
+    }
+}
+
+static void write_u64_padded(uint64_t v, int width) {
+    char buf[24];
+    int n = 0;
+    if (v == 0) {
+        buf[n++] = '0';
+    } else {
+        char tmp[24];
+        int t = 0;
+        while (v > 0 && t < (int)sizeof(tmp)) {
+            tmp[t++] = (char)('0' + (v % 10));
+            v /= 10;
+        }
+        while (t > 0) {
+            buf[n++] = tmp[--t];
+        }
+    }
+    for (int i = n; i < width; i++) {
+        console_putchar(' ');
+    }
+    for (int i = 0; i < n; i++) {
+        console_putchar(buf[i]);
+    }
+}
+
 void uthread_list(void) {
     console_writestring("\nSlot  PID  #InProc  TID   Type    State       Prio  Name\n");
-    console_writestring("----  ---  -------  ----  ------  ----------  ----  ----------\n");
+    console_writestring("----  ---  -------  ----  ------  ----------  ----  --------------\n");
 
     int count = 0;
     for (int i = 0; i < MAX_UTHREADS; i++) {
@@ -795,39 +849,39 @@ void uthread_list(void) {
         }
         count++;
 
-        console_write_dec(uthread_slot_of(u));
+        write_u64_padded((uint64_t)uthread_slot_of(u), 4);
         console_writestring("  ");
 
         if (u->proc && u->proc->pid) {
-            console_write_dec(u->proc->pid);
+            write_u64_padded((uint64_t)u->proc->pid, 3);
         } else {
-            console_writestring("-");
+            write_padded("-", 3);
         }
         console_writestring("  ");
 
         int pin = uthread_index_in_proc(u);
         if (pin > 0) {
-            console_write_dec((uint64_t)pin);
+            write_u64_padded((uint64_t)pin, 7);
         } else {
-            console_putchar('-');
+            write_padded("-", 7);
         }
-        console_writestring("     ");
-
-        console_write_dec(u->uthread_id);
         console_writestring("  ");
-        console_writestring(uthread_type_name(u->type));
-        console_writestring("    ");
-        console_writestring(uthread_state_name(u->state));
-        console_writestring("    ");
-        console_write_dec(u->priority);
+
+        write_u64_padded((uint64_t)u->uthread_id, 4);
+        console_writestring("  ");
+        write_padded(uthread_type_name(u->type), 6);
+        console_writestring("  ");
+        write_padded(uthread_state_name(u->state), 10);
+        console_writestring("  ");
+        write_u64_padded((uint64_t)u->priority, 4);
         console_writestring("    ");
 
         if (u->proc && u->proc->name[0]) {
-            console_writestring(u->proc->name);
+            write_padded(u->proc->name, 14);
         } else if (u->lwkt && u->lwkt->name[0]) {
-            console_writestring(u->lwkt->name);
+            write_padded(u->lwkt->name, 14);
         } else {
-            console_writestring("-");
+            write_padded("-", 14);
         }
         console_putchar('\n');
     }

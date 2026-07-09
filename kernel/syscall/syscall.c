@@ -446,6 +446,30 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
             break;
         }
 
+        case SYS_SMP_BALANCE:
+            lwkt_smp_balance();
+            ret = 0;
+            break;
+
+        case SYS_KILL:
+            ret = (uint64_t)(int64_t)proc_kill((uint32_t)a1);
+            break;
+
+        case SYS_KILLALL:
+            proc_kill_children();
+            ret = 0;
+            break;
+
+        case SYS_KILLALL_NAME: {
+            char pname[32];
+            if (copy_user_string(pname, (const char *)(uintptr_t)a1, sizeof(pname)) != 0) {
+                ret = (uint64_t)-1;
+                break;
+            }
+            ret = (uint64_t)(int64_t)proc_kill_name(pname);
+            break;
+        }
+
         default:
             ret = (uint64_t)-1;
             break;
@@ -459,7 +483,6 @@ uint64_t syscall_post_dispatch(uint64_t ret) {
     struct lwkt_thread *cur = lwkt_curthread();
     if (cur) {
         if (cur->pending_kill) {
-            cur->pending_kill = 0;
             cur->in_syscall = 0;
             runner_longjmp(&cur->runner_jmp, 1);
         }

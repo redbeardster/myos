@@ -125,9 +125,14 @@ static void cmd_help(void) {
     write_str("  about           - system info\n");
     write_str("  echo <text>     - print text\n");
     write_str("  exec [name]     - run ELF (default hello.elf)\n");
+    write_str("  spin            - run long-lived spin.elf workload\n");
     write_str("  ps              - list processes (CR3, uthreads)\n");
     write_str("  uthreads        - list uthreads (slot, proc, lwkt)\n");
     write_str("  cpus            - SMP CPU status (per-CPU scheduler)\n");
+    write_str("  smpbalance      - per-CPU runner/LWKT distribution\n");
+    write_str("  smpbench        - exec spin.elf + SMP snapshot\n");
+    write_str("  kill <pid>      - kill process by pid (except shell)\n");
+    write_str("  killall <name>  - kill all child processes by name\n");
     write_str("  threads         - list LWKT scheduler threads\n");
     write_str("  ports           - list named msgports\n");
     write_str("  msg [port] text - send to msgport (default msgd)\n");
@@ -184,6 +189,78 @@ static void run_command(char *line) {
 
     if (str_eq(line, "cpus")) {
         myos_cpus();
+        return;
+    }
+
+    if (str_eq(line, "smpbalance")) {
+        myos_smp_balance();
+        return;
+    }
+
+    if (str_eq(line, "smpbench")) {
+        write_str("\n[smpbench] starting spin.elf (long-lived child runner)...\n");
+        long pid = myos_exec("spin.elf");
+        if (pid < 0) {
+            write_str("[smpbench] exec failed rc=");
+            write_rc(pid);
+            write_str(" (likely process table full)\n");
+            return;
+        }
+        write_str("[smpbench] child pid=");
+        write_dec((unsigned long)pid);
+        write_str("\n");
+        for (int i = 0; i < 3; i++) {
+            myos_yield();
+        }
+        myos_smp_balance();
+        myos_threads();
+        write_str("[smpbench] done (re-run smpbalance; use kill to stop spin.elf)\n");
+        return;
+    }
+
+    if (str_eq(line, "killall")) {
+        write_str("\nusage: killall <name>\n");
+        return;
+    }
+
+    if (str_starts(line, "killall ")) {
+        const char *arg = line + 8;
+        skip_spaces(&arg);
+        if (*arg == '\0') {
+            write_str("\nusage: killall <name>\n");
+            return;
+        }
+        long rc = myos_killall_name(arg);
+        write_str("\nkillall \"");
+        write_str(arg);
+        write_str("\" killed=");
+        if (rc < 0) {
+            write_rc(rc);
+        } else {
+            write_dec((unsigned long)rc);
+        }
+        write_str("\n");
+        return;
+    }
+
+    if (str_starts(line, "kill ")) {
+        const char *arg = line + 5;
+        skip_spaces(&arg);
+        unsigned long pid = 0;
+        if (parse_u32(arg, &pid) != 0 || pid == 0) {
+            write_str("\nusage: kill <pid>\n");
+            return;
+        }
+        long rc = myos_kill((long)pid);
+        write_str("\nkill ");
+        write_dec(pid);
+        if (rc == 0) {
+            write_str(" ok\n");
+        } else {
+            write_str(" rc=");
+            write_rc(rc);
+            write_str("\n");
+        }
         return;
     }
 
@@ -778,6 +855,8 @@ static void run_command(char *line) {
         if (pid < 0) {
             write_str("\nexec failed: ");
             write_str(name);
+            write_str(" rc=");
+            write_rc(pid);
             write_str("\n");
             return;
         }
@@ -804,6 +883,20 @@ static void run_command(char *line) {
         write_str(" (");
         write_str(name);
         write_str(")\n");
+        return;
+    }
+
+    if (str_eq(line, "spin")) {
+        long pid = myos_exec("spin.elf");
+        if (pid < 0) {
+            write_str("\nexec failed: spin.elf rc=");
+            write_rc(pid);
+            write_str("\n");
+            return;
+        }
+        write_str("\nStarted process ");
+        write_dec((unsigned long)pid);
+        write_str(" (spin.elf)\n");
         return;
     }
 

@@ -223,6 +223,33 @@ user: SYS_EXIT
 
 ---
 
+## 6.1. Kill strict semantics (summary)
+
+Целевой контракт:
+
+- `kill <pid>` успешен только если PID фактически исчез из `proc_table`.
+- `killall <name>` возвращает число реально уничтоженных процессов.
+
+Краткая цепочка:
+
+```text
+SYS_KILL / SYS_KILLALL_NAME
+  -> proc_kill / proc_kill_name
+  -> proc_kill_request
+       -> proc_destroy(remote) -> runner->pending_kill=1 + IPI/unblock
+  -> proc_kill_wait_dead (bounded wait until PID absent)
+```
+
+Критичные инварианты:
+
+- Нельзя разрушать `cpu->current` чужого CPU напрямую.
+- Для single-uthread процессов (`spin.elf`) при `pending_kill` нужен форсированный возврат в runner loop (`uthread_yield` -> `uthread_return_to_runner`), иначе kill может "висеть" в `hlt`-цикле.
+- В `syscall_post_dispatch` нельзя преждевременно очищать `pending_kill` до перехода в runner.
+
+Детальная схема с кодом и моделью памяти: [PROC_RUNNER.md](PROC_RUNNER.md) §8.2.
+
+---
+
 ## 7. Добавление нового syscall
 
 1. Константа в `include/myos_abi.h` и обёртка в `user/myos.h`.

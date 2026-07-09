@@ -33,6 +33,10 @@
 #define SYS_CAP_GRANT       MYOS_SYS_CAP_GRANT
 #define SYS_CAP_CLOSE       MYOS_SYS_CAP_CLOSE
 #define SYS_GETPID          MYOS_SYS_GETPID
+#define SYS_SMP_BALANCE     MYOS_SYS_SMP_BALANCE
+#define SYS_KILL            MYOS_SYS_KILL
+#define SYS_KILLALL         MYOS_SYS_KILLALL
+#define SYS_KILLALL_NAME    MYOS_SYS_KILLALL_NAME
 
 void syscall_init(void);
 uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,

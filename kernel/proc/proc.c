@@ -1,6 +1,7 @@
 #include "proc.h"
 
 #include "console.h"
+#include "interrupt.h"
 #include "lwkt.h"
 #include "myos_abi.h"
 #include "proc_mutex.h"
@@ -10,7 +11,8 @@
 
 #include <stdint.h>
 
-#define MAX_PROCS 8
+#define MAX_PROCS 16
+#define PROC_KILL_WAIT_TICKS 500
 
 static struct proc proc_table[MAX_PROCS];
 static uint32_t next_pid = 1;
@@ -33,6 +35,20 @@ static void strcpy_local(char *dst, const char *src) {
         *dst++ = *src++;
     }
     *dst = '\0';
+}
+
+static int str_eq_local(const char *a, const char *b) {
+    if (!a || !b) {
+        return 0;
+    }
+    while (*a && *b) {
+        if (*a != *b) {
+            return 0;
+        }
+        a++;
+        b++;
+    }
+    return *a == '\0' && *b == '\0';
 }
 
 static struct proc *alloc_proc(void) {
@@ -95,6 +111,72 @@ static void proc_reset_slot(struct proc *p) {
 
 static const char *state_name(enum proc_state state) {
     return state == PROC_RUNNING ? "running" : "dead";
+}
+
+static void write_padded(const char *s, int width) {
+    int n = 0;
+    if (!s) {
+        s = "-";
+    }
+    while (s[n] && n < width) {
+        console_putchar(s[n]);
+        n++;
+    }
+    while (n < width) {
+        console_putchar(' ');
+        n++;
+    }
+}
+
+static void write_u64_padded(uint64_t v, int width) {
+    char buf[24];
+    int n = 0;
+    if (v == 0) {
+        buf[n++] = '0';
+    } else {
+        char tmp[24];
+        int t = 0;
+        while (v > 0 && t < (int)sizeof(tmp)) {
+            tmp[t++] = (char)('0' + (v % 10));
+            v /= 10;
+        }
+        while (t > 0) {
+            buf[n++] = tmp[--t];
+        }
+    }
+    for (int i = n; i < width; i++) {
+        console_putchar(' ');
+    }
+    for (int i = 0; i < n; i++) {
+        console_putchar(buf[i]);
+    }
+}
+
+static void write_hex_padded(uint64_t v, int width) {
+    char buf[24];
+    int n = 0;
+    static const char hex[] = "0123456789abcdef";
+    if (v == 0) {
+        buf[n++] = '-';
+    } else {
+        char tmp[16];
+        int t = 0;
+        while (v > 0 && t < (int)sizeof(tmp)) {
+            tmp[t++] = hex[v & 0xFULL];
+            v >>= 4;
+        }
+        buf[n++] = '0';
+        buf[n++] = 'x';
+        while (t > 0) {
+            buf[n++] = tmp[--t];
+        }
+    }
+    for (int i = n; i < width; i++) {
+        console_putchar(' ');
+    }
+    for (int i = 0; i < n; i++) {
+        console_putchar(buf[i]);
+    }
 }
 
 struct proc *proc_create(const char *name, uint64_t cr3, uint64_t entry,
@@ -239,17 +321,29 @@ void proc_destroy(struct proc *p) {
     }
 
     uint64_t irqf;
+    struct lwkt_thread *runner_to_wake = NULL;
     spin_lock_irqsave(&proc_table_lock, &irqf);
 
     if (p->runner && p->runner->id) {
         struct lwkt_thread *cur = lwkt_curthread();
-        uint32_t rid = p->runner->id;
-        p->runner = NULL;
-        spin_unlock_irqrestore(&proc_table_lock, irqf);
-        if (cur != lwkt_find(rid)) {
-            lwkt_destroy(rid);
+        if (cur != p->runner) {
+            /*
+             * Remote destroy request: do not tear down address space from a
+             * different CPU while runner may still execute in it.
+             * Ask runner to self-destruct at a safe reschedule point.
+             */
+            p->runner->pending_kill = 1;
+            runner_to_wake = p->runner;
+            spin_unlock_irqrestore(&proc_table_lock, irqf);
+            if (runner_to_wake->state == THREAD_BLOCKED) {
+                lwkt_unblock(runner_to_wake);
+            } else {
+                lwkt_sched_ipi_others();
+            }
+            return;
         }
-        spin_lock_irqsave(&proc_table_lock, &irqf);
+        /* Self path (runner CPU): safe to continue full destruction. */
+        p->runner = NULL;
     }
 
     if (p->cr3) {
@@ -279,7 +373,17 @@ void proc_kill_all(void) {
     }
 }
 
-int proc_kill(uint32_t pid) {
+static int proc_is_dead(uint32_t pid) {
+    struct proc *p = find_proc(pid);
+    return !p || p->pid == 0;
+}
+
+static void proc_kill_nudge(void) {
+    lwkt_sched_ipi_others();
+    __asm__ volatile("sti; hlt" ::: "memory");
+}
+
+static int proc_kill_request(uint32_t pid) {
     struct proc *p = find_proc(pid);
     if (!p || p->state != PROC_RUNNING) {
         return -1;
@@ -287,6 +391,16 @@ int proc_kill(uint32_t pid) {
 
     if (p->is_shell) {
         return -2;
+    }
+
+    struct lwkt_thread *cur = lwkt_curthread();
+    if (p->runner && cur != p->runner) {
+        /*
+         * Cross-CPU/process kill: request cooperative runner termination.
+         * Avoid direct uthread_kill() on foreign running uthreads.
+         */
+        proc_destroy(p);
+        return 0;
     }
 
     uint32_t ids[MAX_THREADS];
@@ -300,20 +414,78 @@ int proc_kill(uint32_t pid) {
         uthread_kill(ids[i]);
     }
 
-    if (p->runner && p->runner->id) {
-        lwkt_destroy(p->runner->id);
-        p->runner = NULL;
-    }
-
     if (p->pid != 0) {
         proc_destroy(p);
     }
     return 0;
 }
 
+static int proc_kill_wait_dead(uint32_t pid) {
+    uint32_t start = (uint32_t)timer_get_ticks();
+    while ((uint32_t)(timer_get_ticks() - start) < PROC_KILL_WAIT_TICKS) {
+        if (proc_is_dead(pid)) {
+            return 0;
+        }
+        proc_kill_nudge();
+    }
+    return proc_is_dead(pid) ? 0 : -4;
+}
+
+int proc_kill(uint32_t pid) {
+    int rc = proc_kill_request(pid);
+    if (rc != 0) {
+        return rc;
+    }
+    return proc_kill_wait_dead(pid);
+}
+
+int proc_kill_name(const char *name) {
+    if (!name || name[0] == '\0') {
+        return -1;
+    }
+
+    uint32_t pids[MAX_PROCS];
+    int count = 0;
+
+    uint64_t irqf;
+    spin_lock_irqsave(&proc_table_lock, &irqf);
+    for (int i = 0; i < MAX_PROCS; i++) {
+        struct proc *p = &proc_table[i];
+        if (p->pid == 0 || p->state != PROC_RUNNING || p->is_shell) {
+            continue;
+        }
+        if (!str_eq_local(p->name, name)) {
+            continue;
+        }
+        if (count < MAX_PROCS) {
+            pids[count++] = p->pid;
+        }
+    }
+    spin_unlock_irqrestore(&proc_table_lock, irqf);
+
+    if (count == 0) {
+        return -2;
+    }
+
+    int killed = 0;
+    int failed = 0;
+    for (int i = 0; i < count; i++) {
+        int rc = proc_kill(pids[i]);
+        if (rc == 0) {
+            killed++;
+        } else if (rc != -1) {
+            failed++;
+        }
+    }
+    if (killed > 0) {
+        return killed;
+    }
+    return failed > 0 ? -3 : -2;
+}
+
 void proc_list(void) {
     console_writestring("\nPID  Name            State    CR3              Uthreads\n");
-    console_writestring("---  --------------  -------  ---------------  -------\n");
+    console_writestring("---  --------------  -------  ---------------  --------\n");
 
     int count = 0;
     for (int i = 0; i < MAX_PROCS; i++) {
@@ -322,15 +494,15 @@ void proc_list(void) {
             continue;
         }
         count++;
-        console_write_dec(p->pid);
+        write_u64_padded((uint64_t)p->pid, 3);
         console_writestring("  ");
-        console_writestring(p->name);
+        write_padded(p->name, 14);
         console_writestring("  ");
-        console_writestring(state_name(p->state));
+        write_padded(state_name(p->state), 7);
         console_writestring("  ");
-        console_write_hex(p->cr3);
+        write_hex_padded(p->cr3, 15);
         console_writestring("  ");
-        console_write_dec((uint64_t)p->uthread_count);
+        write_u64_padded((uint64_t)p->uthread_count, 8);
         console_putchar('\n');
     }
 

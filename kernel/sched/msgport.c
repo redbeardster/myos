@@ -151,6 +151,45 @@ static void strcpy_port_name(char *dst, const char *src) {
     dst[i] = '\0';
 }
 
+static void write_padded(const char *s, int width) {
+    int n = 0;
+    if (!s) {
+        s = "-";
+    }
+    while (s[n] && n < width) {
+        console_putchar(s[n]);
+        n++;
+    }
+    while (n < width) {
+        console_putchar(' ');
+        n++;
+    }
+}
+
+static void write_u64_padded(uint64_t v, int width) {
+    char buf[24];
+    int n = 0;
+    if (v == 0) {
+        buf[n++] = '0';
+    } else {
+        char tmp[24];
+        int t = 0;
+        while (v > 0 && t < (int)sizeof(tmp)) {
+            tmp[t++] = (char)('0' + (v % 10));
+            v /= 10;
+        }
+        while (t > 0) {
+            buf[n++] = tmp[--t];
+        }
+    }
+    for (int i = n; i < width; i++) {
+        console_putchar(' ');
+    }
+    for (int i = 0; i < n; i++) {
+        console_putchar(buf[i]);
+    }
+}
+
 int msgport_register(const char *name, struct lwkt_thread *owner) {
     if (!name || !name[0] || !owner || owner->id == 0) {
         return -1;
@@ -244,8 +283,8 @@ int msg_send_name(const char *name, uint32_t type, const void *data, uint32_t si
 
 void msgport_list(void) {
     console_writestring("\nNamed msgports:\n");
-    console_writestring("  Name            LWKT id\n");
-    console_writestring("  --------------  -------\n");
+    console_writestring("  Name              LWKT id\n");
+    console_writestring("  ----------------  -------\n");
 
     uint64_t irqf;
     spin_lock_irqsave(&named_ports_lock, &irqf);
@@ -256,9 +295,9 @@ void msgport_list(void) {
         }
         count++;
         console_writestring("  ");
-        console_writestring(named_ports[i].name);
+        write_padded(named_ports[i].name, 16);
         console_writestring("  ");
-        console_write_dec(named_ports[i].lwkt_id);
+        write_u64_padded((uint64_t)named_ports[i].lwkt_id, 7);
         console_putchar('\n');
     }
     spin_unlock_irqrestore(&named_ports_lock, irqf);

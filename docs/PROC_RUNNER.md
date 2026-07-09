@@ -257,6 +257,52 @@ In-proc pick: **меньше число = выше приоритет** (как 
   - `capdiag grantstress N` — циклический grant-path (create/grant/send/recv/close).
 - Критичный инвариант: каждый раунд обязан закрывать созданные cap-слоты (`capclose`), иначе после `MYOS_CAP_MAX` раундов будет `create rc=-1` (исчерпание таблицы), что не является SMP race.
 
+### 8.2. Kill strict semantics (SMP)
+
+Текущий контракт:
+
+- `kill <pid>` возвращает `0` только если PID фактически исчез из `proc_table`.
+- `killall <name>` возвращает количество реально убитых процессов.
+- Для remote-CPU kill используется кооперативный путь через `pending_kill`, без разрушения чужого `cpu->current` "в лоб".
+
+Цепочка вызовов:
+
+```text
+user shell: kill / killall <name>
+  -> syscall_dispatch(SYS_KILL / SYS_KILLALL_NAME)
+  -> proc_kill(pid) / proc_kill_name(name)
+  -> proc_kill_request(pid)
+       -> proc_destroy(p) [remote path]
+            -> runner->pending_kill = 1
+            -> lwkt_unblock(runner) или lwkt_sched_ipi_others()
+  -> proc_kill_wait_dead(pid)  # strict wait-until-dead
+       -> poll find_proc(pid)
+       -> nudge scheduler (IPI + sti;hlt)
+```
+
+Где именно обрабатывается `pending_kill`:
+
+- `uthread_yield`: если `runner->pending_kill`, принудительно `uthread_return_to_runner(p)`.
+- `lwkt_preempt_check`/`lwkt_yield`: для user-runner с `pending_kill` делается `runner_longjmp`.
+- `proc_runner_entry`: при входе в loop проверяет `runner->pending_kill`, затем `proc_destroy(p)` и `lwkt_thread_exit()`.
+
+Почему раньше kill "частично" не завершался:
+
+- Для процесса с одним uthread (`spin.elf`) код часто оставался в `lwkt_syscall_wait_edge()` внутри `uthread_yield` и не возвращался в runner loop достаточно быстро.
+- `killall` тогда сообщал число отправленных запросов, а не факт реального teardown.
+- Исправлено:
+  1) форсированный возврат в runner при `pending_kill`;
+  2) strict wait в `proc_kill_wait_dead`;
+  3) в `syscall_post_dispatch` не очищается `pending_kill` до перехода в runner.
+
+Модель памяти и синхронизация (x86-64 SMP):
+
+- Запись `pending_kill=1` делается под `proc_table_lock` (`spin_lock_irqsave`), затем unlock.
+- IPI/unblock после unlock ускоряет видимость/прогресс на owning CPU.
+- Чтение `pending_kill` выполняется на owning CPU в scheduler/runner safe points.
+- Линеаризуемый критерий завершения: `find_proc(pid) == NULL || pid==0` в `proc_kill_wait_dead`.
+- Таким образом `kill` имеет semantics "process is dead", а не "kill requested".
+
 ---
 
 ## 9. Ссылки

@@ -69,8 +69,6 @@ int exec_spawn_elf(const void *elf, size_t size, const char *name, uint32_t flag
 
     if (is_shell) {
         proc_kill_all();
-    } else {
-        proc_kill_children();
     }
 
     uint64_t cr3 = vmm_aspace_create();

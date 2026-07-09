@@ -212,6 +212,45 @@ static void strcpy_snap(char *dst, const char *src, int cap) {
     dst[i] = '\0';
 }
 
+static void write_padded(const char *s, int width) {
+    int n = 0;
+    if (!s) {
+        s = "-";
+    }
+    while (s[n] && n < width) {
+        console_putchar(s[n]);
+        n++;
+    }
+    while (n < width) {
+        console_putchar(' ');
+        n++;
+    }
+}
+
+static void write_u64_padded(uint64_t v, int width) {
+    char buf[24];
+    int n = 0;
+    if (v == 0) {
+        buf[n++] = '0';
+    } else {
+        char tmp[24];
+        int t = 0;
+        while (v > 0 && t < (int)sizeof(tmp)) {
+            tmp[t++] = (char)('0' + (v % 10));
+            v /= 10;
+        }
+        while (t > 0) {
+            buf[n++] = tmp[--t];
+        }
+    }
+    for (int i = n; i < width; i++) {
+        console_putchar(' ');
+    }
+    for (int i = 0; i < n; i++) {
+        console_putchar(buf[i]);
+    }
+}
+
 void cpu_list(void) {
     struct {
         uint32_t id;
@@ -246,23 +285,23 @@ void cpu_list(void) {
     }
     spin_unlock(&cpu_list_lock);
 
-    console_writestring("\nCPU  Lapic  BSP  Sched  Switches  Current thread\n");
-    console_writestring("---  -----  ---  -----  --------  --------------\n");
+    console_writestring("\nCPU  Lapic  BSP  Sched  Switches    Current thread\n");
+    console_writestring("---  -----  ---  -----  ---------   -------------------------\n");
 
     for (uint32_t i = 0; i < ncpu; i++) {
-        console_write_dec(snap[i].id);
-        console_writestring("    ");
-        console_write_dec(snap[i].lapic_id);
-        console_writestring("      ");
-        console_writestring(snap[i].bsp ? "yes" : "no ");
+        write_u64_padded((uint64_t)snap[i].id, 3);
+        console_writestring("  ");
+        write_u64_padded((uint64_t)snap[i].lapic_id, 5);
+        console_writestring("  ");
+        write_padded(snap[i].bsp ? "yes" : "no", 3);
+        console_writestring("  ");
+        write_padded(snap[i].sched_active ? "on" : "off", 5);
+        console_writestring("  ");
+        write_u64_padded((uint64_t)snap[i].switches, 9);
         console_writestring("   ");
-        console_writestring(snap[i].sched_active ? "on " : "off");
-        console_writestring("    ");
-        console_write_dec(snap[i].switches);
-        console_writestring("        ");
 
         if (snap[i].has_current) {
-            console_writestring(snap[i].tname);
+            write_padded(snap[i].tname, 10);
             console_writestring(" (");
             switch (snap[i].tstate) {
                 case THREAD_READY: console_writestring("ready"); break;
@@ -273,7 +312,7 @@ void cpu_list(void) {
             }
             console_putchar(')');
         } else {
-            console_writestring("-");
+            write_padded("-", 10);
         }
         console_putchar('\n');
     }

@@ -48,6 +48,10 @@
 #define MYOS_SYS_CAP_GRANT       26
 #define MYOS_SYS_CAP_CLOSE       27
 #define MYOS_SYS_GETPID          28
+#define MYOS_SYS_SMP_BALANCE     29
+#define MYOS_SYS_KILL            30
+#define MYOS_SYS_KILLALL         31
+#define MYOS_SYS_KILLALL_NAME    32
 
 #define MYOS_PROC_MUTEX_MAX    8
 

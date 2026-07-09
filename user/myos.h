@@ -159,4 +159,20 @@ static inline long myos_getpid(void) {
     return myos_syscall4(MYOS_SYS_GETPID, 0, 0, 0, 0);
 }
 
+static inline long myos_smp_balance(void) {
+    return myos_syscall4(MYOS_SYS_SMP_BALANCE, 0, 0, 0, 0);
+}
+
+static inline long myos_kill(long pid) {
+    return myos_syscall4(MYOS_SYS_KILL, pid, 0, 0, 0);
+}
+
+static inline long myos_killall(void) {
+    return myos_syscall4(MYOS_SYS_KILLALL, 0, 0, 0, 0);
+}
+
+static inline long myos_killall_name(const char *name) {
+    return myos_syscall4(MYOS_SYS_KILLALL_NAME, (long)(uintptr_t)name, 0, 0, 0);
+}
+
 #endif

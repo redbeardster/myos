@@ -30,6 +30,7 @@ static uint64_t ipc_bump_skipped_disabled;
 
 static struct cpu *this_cpu(void);
 static void strcpy_local(char *dst, const char *src);
+static int thread_owner_cpu_id(struct lwkt_thread *t);
 
 static void cpu_run_queues_init(struct cpu *cpu) {
     if (!cpu) {
@@ -261,6 +262,22 @@ static struct cpu *this_cpu(void) {
     return cpu_current();
 }
 
+static int thread_owner_cpu_id(struct lwkt_thread *t) {
+    if (!t) {
+        return -1;
+    }
+    for (uint32_t i = 0; i < cpu_online_count(); i++) {
+        struct cpu *c = cpu_by_id(i);
+        if (!c || !c->online) {
+            continue;
+        }
+        if (c->current == t) {
+            return (int)c->id;
+        }
+    }
+    return -1;
+}
+
 static void init_thread_stack(struct lwkt_thread *t) {
     uint64_t *sp = (uint64_t *)(t->stack + STACK_SIZE);
     sp = (uint64_t *)((uint64_t)sp & ~0xFULL);
@@ -319,35 +336,138 @@ static void print_uthread_cols(struct lwkt_thread *t) {
     console_writestring("  ");
 }
 
+static void write_padded(const char *s, int width) {
+    int n = 0;
+    if (!s) {
+        s = "-";
+    }
+    while (s[n] && n < width) {
+        console_putchar(s[n]);
+        n++;
+    }
+    while (n < width) {
+        console_putchar(' ');
+        n++;
+    }
+}
+
+static void write_u64_padded(uint64_t v, int width) {
+    char buf[24];
+    int n = 0;
+    if (v == 0) {
+        buf[n++] = '0';
+    } else {
+        char tmp[24];
+        int t = 0;
+        while (v > 0 && t < (int)sizeof(tmp)) {
+            tmp[t++] = (char)('0' + (v % 10));
+            v /= 10;
+        }
+        while (t > 0) {
+            buf[n++] = tmp[--t];
+        }
+    }
+    for (int i = n; i < width; i++) {
+        console_putchar(' ');
+    }
+    for (int i = 0; i < n; i++) {
+        console_putchar(buf[i]);
+    }
+}
+
+static void write_hex_padded(uint64_t v, int width) {
+    char buf[24];
+    int n = 0;
+    if (v == 0) {
+        buf[n++] = '-';
+    } else {
+        static const char hex[] = "0123456789abcdef";
+        char tmp[16];
+        int t = 0;
+        while (v > 0 && t < (int)sizeof(tmp)) {
+            tmp[t++] = hex[v & 0xFULL];
+            v >>= 4;
+        }
+        buf[n++] = '0';
+        buf[n++] = 'x';
+        while (t > 0) {
+            buf[n++] = tmp[--t];
+        }
+    }
+    for (int i = n; i < width; i++) {
+        console_putchar(' ');
+    }
+    for (int i = 0; i < n; i++) {
+        console_putchar(buf[i]);
+    }
+}
+
+static void write_ratio_padded(uint64_t a, uint64_t b, int width) {
+    char buf[32];
+    int n = 0;
+    char tmp[20];
+    int t = 0;
+
+    if (a == 0) {
+        buf[n++] = '0';
+    } else {
+        t = 0;
+        while (a > 0 && t < (int)sizeof(tmp)) {
+            tmp[t++] = (char)('0' + (a % 10));
+            a /= 10;
+        }
+        while (t > 0) {
+            buf[n++] = tmp[--t];
+        }
+    }
+    buf[n++] = '/';
+    if (b == 0) {
+        buf[n++] = '0';
+    } else {
+        t = 0;
+        while (b > 0 && t < (int)sizeof(tmp)) {
+            tmp[t++] = (char)('0' + (b % 10));
+            b /= 10;
+        }
+        while (t > 0) {
+            buf[n++] = tmp[--t];
+        }
+    }
+    for (int i = n; i < width; i++) {
+        console_putchar(' ');
+    }
+    for (int i = 0; i < n; i++) {
+        console_putchar(buf[i]);
+    }
+}
+
 static void print_thread_row(struct lwkt_thread *t, int is_current) {
     int cpu_idx = cpu_index_of_thread(t);
-    console_write_dec(t->id);
+    write_u64_padded(t->id, 4);
     print_uthread_cols(t);
-    console_writestring(t->name);
+    write_padded(t->name, 14);
     console_writestring("  ");
-    console_write_dec(t->priority);
-    console_writestring("     ");
-    console_writestring(state_name(t->state));
+    write_u64_padded(t->priority, 4);
+    console_writestring("  ");
+    write_padded(state_name(t->state), 9);
     if (is_current) {
-        console_writestring(" *  ");
+        console_writestring("* ");
     } else {
-        console_writestring("    ");
+        console_writestring("  ");
     }
     if (cpu_idx >= 0) {
-        console_write_dec((uint64_t)cpu_idx);
+        write_u64_padded((uint64_t)cpu_idx, 3);
     } else {
-        console_putchar('-');
+        write_padded("-", 3);
     }
     console_writestring("  ");
-    if (t->user_cr3) {
-        console_write_hex(t->user_cr3);
-    } else {
-        console_writestring("-");
-    }
+    write_hex_padded(t->user_cr3, 15);
     console_writestring("  ");
     console_write_dec(t->quantum_expired);
     console_writestring("/");
     console_write_dec(t->quantum_forced_switches);
+    console_writestring("/");
+    console_write_dec(t->cpu_migrations);
     console_putchar('\n');
 }
 
@@ -552,6 +672,8 @@ struct lwkt_thread *lwkt_create(const char *name, void (*entry)(void *), void *a
     t->user_proc = NULL;
     t->next = NULL;
     t->run_cpu = 0;
+    t->last_cpu_executed = (uint32_t)-1;
+    t->cpu_migrations = 0;
     t->user_cr3 = 0;
     t->pending_cr3_destroy = 0;
     t->yields = 0;
@@ -583,6 +705,11 @@ int lwkt_destroy(uint32_t id) {
         return -1;
     }
 
+    int wake_blocked = 0;
+    int remote_running = 0;
+    int self_current = 0;
+    int owner_cpu = -1;
+
     uint64_t irqf;
     sched_lock_irqsave(&irqf);
     struct lwkt_thread *t = find_thread(id);
@@ -592,25 +719,56 @@ int lwkt_destroy(uint32_t id) {
     }
 
     enum thread_state old = t->state;
+    owner_cpu = thread_owner_cpu_id(t);
+    self_current = owner_cpu >= 0 &&
+                   this_cpu() &&
+                   owner_cpu == (int)this_cpu()->id;
+
+    if (owner_cpu >= 0 && !self_current) {
+        /*
+         * Remote current thread: request cooperative termination on owner CPU.
+         * Do not clear ID/stack here.
+         */
+        t->pending_kill = 1;
+        t->entry_point = NULL;
+        remote_running = 1;
+        sched_unlock_irqrestore(irqf);
+        lwkt_sched_ipi_others();
+        return 0;
+    }
+
+    if (self_current) {
+        t->pending_kill = 1;
+        t->entry_point = NULL;
+        sched_unlock_irqrestore(irqf);
+        lwkt_thread_exit();
+        return 0;
+    }
+
     t->entry_point = NULL;
     remove_from_queues(t);
 
     if (old == THREAD_BLOCKED) {
-        msgport_wakeup(t);
+        t->pending_kill = 1;
+        t->state = THREAD_READY;
+        enqueue_thread(t);
+        wake_blocked = 1;
     } else {
         msgport_clear_slot(t->mbox_slot);
-    }
-
-    t->state = THREAD_TERMINATED;
-
-    struct cpu *cpu = this_cpu();
-    if (t != (cpu ? cpu->current : NULL)) {
         msgport_unregister_id(t->id);
+        t->state = THREAD_TERMINATED;
         t->rsp = 0;
         t->id = 0;
         thread_count--;
     }
     sched_unlock_irqrestore(irqf);
+
+    if (wake_blocked) {
+        msgport_wakeup(t);
+        lwkt_sched_ipi_others();
+    } else if (remote_running) {
+        lwkt_sched_ipi_others();
+    }
     return 0;
 }
 
@@ -715,8 +873,8 @@ void lwkt_list(void) {
     int total;
     uint64_t irqf;
 
-    console_writestring("\nLWKT  Slot Proc  Name            Prio  State      CPU CR3            Qexp/Qsw\n");
-    console_writestring("----  ---- ----  --------------  ----  ---------  --- --------------- --------\n");
+    console_writestring("\nLWKT  Slot Proc  Name            Prio  State      CPU CR3            Qexp/Qsw/Mig\n");
+    console_writestring("----  ---- ----  --------------  ----  ---------  --- --------------- ------------\n");
 
     snap_n = lwkt_list_collect(snap, LWKT_LIST_SNAP_MAX, current);
 
@@ -744,6 +902,60 @@ void lwkt_list(void) {
     console_writestring(" disabled_skip=");
     console_write_dec(ipc_bump_skipped_disabled);
     console_putchar('\n');
+}
+
+void lwkt_smp_balance(void) {
+    console_writestring("\nSMP balance (1 runner LWKT per user process):\n");
+    console_writestring("CPU  Switches   Current          Runners(run/rdy)  LWKT-ready\n");
+    console_writestring("---  ---------  ---------------  ----------------  ----------\n");
+
+    uint64_t irqf;
+    sched_lock_irqsave(&irqf);
+
+    for (uint32_t i = 0; i < cpu_online_count(); i++) {
+        struct cpu *c = cpu_by_id(i);
+        if (!c || !c->online) {
+            continue;
+        }
+
+        unsigned runners_run = 0;
+        unsigned runners_ready = 0;
+        unsigned lwkt_ready = 0;
+
+        struct lwkt_thread *tcur = c->current;
+        if (tcur && tcur != &c->idle && tcur->user_proc) {
+            runners_run = 1;
+        }
+
+        for (uint32_t p = 0; p < MAX_PRIORITY; p++) {
+            for (struct lwkt_thread *t = c->run_queues[p]; t; t = t->next) {
+                if (t == &c->idle || t->state != THREAD_READY) {
+                    continue;
+                }
+                lwkt_ready++;
+                if (t->user_proc) {
+                    runners_ready++;
+                }
+            }
+        }
+
+        write_u64_padded((uint64_t)c->id, 3);
+        console_writestring("  ");
+        write_u64_padded(c->switches, 9);
+        console_writestring("  ");
+        write_padded(tcur ? tcur->name : "-", 15);
+        console_writestring("  ");
+        write_ratio_padded((uint64_t)runners_run, (uint64_t)runners_ready, 16);
+        console_writestring("  ");
+        write_u64_padded((uint64_t)lwkt_ready, 10);
+        console_putchar('\n');
+    }
+
+    sched_unlock_irqrestore(irqf);
+
+    console_writestring(
+        "\nNote: uthreads inside one process share a single runner; "
+        "more CPUs help when there are multiple runners (processes).\n");
 }
 
 struct lwkt_thread *lwkt_curthread(void) {
@@ -878,6 +1090,16 @@ void lwkt_preempt_check(void) {
         return;
     }
 
+    if (cur != &cpu->idle && cur->pending_kill && !cur->in_syscall) {
+        cpu->preempt_requested = 0;
+        if (cur->user_proc) {
+            cur->runner_reswitch = 1;
+            runner_longjmp(&cur->runner_jmp, 1);
+        }
+        lwkt_thread_exit();
+        return;
+    }
+
     if (lwkt_in_usersyscall()) {
         return;
     }
@@ -982,6 +1204,13 @@ void lwkt_switch(void) {
     lwkt_apply_cr3(next);
     lwkt_apply_tss(next);
 
+    if (next != &cpu->idle && next->id != 0) {
+        if (next->last_cpu_executed != (uint32_t)-1 && next->last_cpu_executed != cpu->id) {
+            next->cpu_migrations++;
+        }
+        next->last_cpu_executed = cpu->id;
+    }
+
     if (prev && prev->pending_cr3_destroy) {
         uint64_t destroy_cr3 = prev->pending_cr3_destroy;
         prev->pending_cr3_destroy = 0;
@@ -1009,6 +1238,16 @@ void lwkt_switch(void) {
 }
 
 void lwkt_yield(void) {
+    struct cpu *cpu = this_cpu();
+    struct lwkt_thread *cur = cpu ? cpu->current : NULL;
+    if (cur && cur != &cpu->idle && cur->pending_kill && !cur->in_syscall) {
+        if (cur->user_proc) {
+            cur->runner_reswitch = 1;
+            runner_longjmp(&cur->runner_jmp, 1);
+        }
+        lwkt_thread_exit();
+        return;
+    }
     lwkt_switch();
 }
 

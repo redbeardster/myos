@@ -53,6 +53,7 @@ int proc_start_runner(struct proc *p, uint32_t lwkt_priority);
 void proc_runner_resched(struct proc *p);
 void proc_destroy(struct proc *p);
 int proc_kill(uint32_t pid);
+int proc_kill_name(const char *name);
 void proc_kill_all(void);
 void proc_kill_children(void);
 void proc_list(void);

@@ -49,6 +49,8 @@ struct lwkt_thread {
     struct proc *user_proc;
     struct lwkt_thread *next;
     uint32_t run_cpu;
+    uint32_t last_cpu_executed;
+    uint64_t cpu_migrations;
     uint64_t rsp;
     uint64_t user_cr3;
     uint64_t pending_cr3_destroy;
@@ -85,6 +87,7 @@ struct lwkt_thread *lwkt_create(const char *name, void (*entry)(void *), void *a
 int lwkt_destroy(uint32_t id);
 struct lwkt_thread *lwkt_find(uint32_t id);
 void lwkt_list(void);
+void lwkt_smp_balance(void);
 void lwkt_info(uint32_t id);
 
 void lwkt_switch(void);
