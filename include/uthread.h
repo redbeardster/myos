@@ -51,6 +51,8 @@ struct uthread *uthread_spawn(const char *name, void (*entry)(void *), void *arg
 struct uthread *uthread_spawn_in_proc(struct proc *p, uint64_t rip, uint64_t rsp,
                                       uint64_t arg, uint64_t stack_base, uint32_t priority);
 int uthread_create_in_proc(struct proc *p, uint64_t rip, uint64_t arg, uint32_t priority);
+int uthread_create_in_proc_ex(struct proc *p, uint64_t rip, uint64_t arg, uint32_t priority,
+                              uint32_t flags);
 int uthread_join(uint32_t uthread_id, int *exit_code_out);
 int uthread_kill(uint32_t uthread_id);
 struct uthread *uthread_lookup(uint32_t uthread_id);

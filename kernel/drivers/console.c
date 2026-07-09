@@ -1,6 +1,9 @@
 #include "console.h"
 #include "font.h"
 #include "spinlock.h"
+#include "io.h"
+
+#define COM1 0x3F8
 
 #define FONT_W 8
 #define CHAR_HEIGHT 16
@@ -14,6 +17,38 @@ static unsigned cursor_row;
 static unsigned saved_col;
 static unsigned saved_row;
 static spinlock_t console_lock;
+
+static void serial_init(void) {
+    outb(COM1 + 1, 0x00);
+    outb(COM1 + 3, 0x80);
+    outb(COM1 + 0, 0x03);
+    outb(COM1 + 1, 0x00);
+    outb(COM1 + 3, 0x03);
+    outb(COM1 + 2, 0xC7);
+}
+
+static void serial_putchar(char c) {
+    if (c == '\n') {
+        serial_putchar('\r');
+    }
+    for (int i = 0; i < 10000; i++) {
+        if (inb(COM1 + 5) & 0x20) {
+            outb(COM1, (uint8_t)c);
+            return;
+        }
+    }
+}
+
+int serial_poll_char(void) {
+    if ((inb(COM1 + 5) & 0x01) == 0) {
+        return -1;
+    }
+    return (int)inb(COM1);
+}
+
+int serial_has_char(void) {
+    return (inb(COM1 + 5) & 0x01) != 0;
+}
 
 static const uint32_t palette[16] = {
     0x000000, 0x0000AA, 0x00AA00, 0x00AAAA,
@@ -147,6 +182,7 @@ static void scroll_up(void) {
 
 void console_init(struct limine_framebuffer *framebuffer) {
     spin_init(&console_lock);
+    serial_init();
     fb = framebuffer;
     pixels = (volatile uint32_t *)fb->address;
     cursor_col = 0;
@@ -192,6 +228,9 @@ void console_clear(void) {
 }
 
 static void console_emit_char(char c) {
+    if (c == '\n' || c == '\r' || c == '\t' || c == '\b' || c >= ' ') {
+        serial_putchar(c);
+    }
     unsigned max_cols = fb ? (unsigned)(fb->width / FONT_W) : SCREEN_COLS;
     unsigned max_rows = fb ? (unsigned)(fb->height / CHAR_HEIGHT) : SCREEN_ROWS;
 

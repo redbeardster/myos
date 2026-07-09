@@ -95,6 +95,7 @@ static void proc_reset_slot(struct proc *p) {
     p->heap_next = 0;
     p->stack_next = 0;
     p->is_shell = 0;
+    p->sched_mode = PROC_SCHED_KSE;
     p->uthread_count = 0;
     p->threads = NULL;
     p->main_thread = NULL;
@@ -204,6 +205,7 @@ struct proc *proc_create(const char *name, uint64_t cr3, uint64_t entry,
     p->heap_next = MYOS_USER_HEAP_START;
     p->stack_next = MYOS_USER_STACK_TOP;
     p->is_shell = is_shell;
+    p->sched_mode = PROC_SCHED_KSE;
     p->uthread_count = 0;
     p->threads = NULL;
     p->main_thread = NULL;
@@ -315,34 +317,54 @@ static void proc_destroy_aspace(uint64_t cr3) {
     vmm_aspace_destroy(cr3);
 }
 
+static void proc_request_kill_locked(struct proc *p) {
+    for (struct uthread *u = p->threads; u; u = u->next_in_proc) {
+        if (u->lwkt && u->lwkt->id) {
+            u->lwkt->pending_kill = 1;
+            if (u->lwkt->state == THREAD_BLOCKED) {
+                lwkt_unblock(u->lwkt);
+            }
+        }
+    }
+    if (p->runner && p->runner->id) {
+        p->runner->pending_kill = 1;
+        if (p->runner->state == THREAD_BLOCKED) {
+            lwkt_unblock(p->runner);
+        }
+    }
+}
+
 void proc_destroy(struct proc *p) {
     if (!p || p->pid == 0) {
         return;
     }
 
     uint64_t irqf;
-    struct lwkt_thread *runner_to_wake = NULL;
     spin_lock_irqsave(&proc_table_lock, &irqf);
 
-    if (p->runner && p->runner->id) {
-        struct lwkt_thread *cur = lwkt_curthread();
-        if (cur != p->runner) {
-            /*
-             * Remote destroy request: do not tear down address space from a
-             * different CPU while runner may still execute in it.
-             * Ask runner to self-destruct at a safe reschedule point.
-             */
-            p->runner->pending_kill = 1;
-            runner_to_wake = p->runner;
-            spin_unlock_irqrestore(&proc_table_lock, irqf);
-            if (runner_to_wake->state == THREAD_BLOCKED) {
-                lwkt_unblock(runner_to_wake);
-            } else {
-                lwkt_sched_ipi_others();
-            }
-            return;
-        }
-        /* Self path (runner CPU): safe to continue full destruction. */
+    struct lwkt_thread *cur = lwkt_curthread();
+    int on_proc_lwkt = cur && cur->user_proc == p;
+
+    if (!on_proc_lwkt && (p->uthread_count > 0 || p->runner)) {
+        proc_request_kill_locked(p);
+        spin_unlock_irqrestore(&proc_table_lock, irqf);
+        lwkt_sched_ipi_others();
+        return;
+    }
+
+    if (p->uthread_count > 0) {
+        spin_unlock_irqrestore(&proc_table_lock, irqf);
+        return;
+    }
+
+    if (p->runner && cur != p->runner) {
+        proc_request_kill_locked(p);
+        spin_unlock_irqrestore(&proc_table_lock, irqf);
+        lwkt_sched_ipi_others();
+        return;
+    }
+
+    if (p->runner) {
         p->runner = NULL;
     }
 
@@ -394,29 +416,25 @@ static int proc_kill_request(uint32_t pid) {
     }
 
     struct lwkt_thread *cur = lwkt_curthread();
-    if (p->runner && cur != p->runner) {
-        /*
-         * Cross-CPU/process kill: request cooperative runner termination.
-         * Avoid direct uthread_kill() on foreign running uthreads.
-         */
-        proc_destroy(p);
+    if (cur && cur->user_proc == p) {
+        uint32_t ids[MAX_THREADS];
+        int n = 0;
+        for (struct uthread *u = p->threads; u && n < MAX_THREADS; u = u->next_in_proc) {
+            if (u->uthread_id) {
+                ids[n++] = u->uthread_id;
+            }
+        }
+        for (int i = 0; i < n; i++) {
+            uthread_kill(ids[i]);
+        }
+
+        if (p->pid != 0) {
+            proc_destroy(p);
+        }
         return 0;
     }
 
-    uint32_t ids[MAX_THREADS];
-    int n = 0;
-    for (struct uthread *u = p->threads; u && n < MAX_THREADS; u = u->next_in_proc) {
-        if (u->uthread_id) {
-            ids[n++] = u->uthread_id;
-        }
-    }
-    for (int i = 0; i < n; i++) {
-        uthread_kill(ids[i]);
-    }
-
-    if (p->pid != 0) {
-        proc_destroy(p);
-    }
+    proc_destroy(p);
     return 0;
 }
 
@@ -435,6 +453,16 @@ int proc_kill(uint32_t pid) {
     int rc = proc_kill_request(pid);
     if (rc != 0) {
         return rc;
+    }
+    if (proc_is_dead(pid)) {
+        return 0;
+    }
+  /*
+   * From int 0x80 the caller LWKT stays RUNNING across sti;hlt — victims on
+   * the same CPU never run. Return EAGAIN so userland retries after yield.
+   */
+    if (lwkt_in_usersyscall()) {
+        return MYOS_ERR_AGAIN;
     }
     return proc_kill_wait_dead(pid);
 }
@@ -481,6 +509,24 @@ int proc_kill_name(const char *name) {
         return killed;
     }
     return failed > 0 ? -3 : -2;
+}
+
+int proc_set_sched_mode(struct proc *p, uint32_t mode) {
+    if (!p) {
+        return -1;
+    }
+    if (mode != PROC_SCHED_RUNNER && mode != PROC_SCHED_KSE) {
+        return -2;
+    }
+    p->sched_mode = mode;
+    return 0;
+}
+
+int proc_get_sched_mode(struct proc *p) {
+    if (!p) {
+        return -1;
+    }
+    return (int)p->sched_mode;
 }
 
 void proc_list(void) {

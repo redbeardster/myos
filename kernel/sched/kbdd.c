@@ -84,6 +84,26 @@ static void kbdd_drain_scancodes(void) {
     }
 }
 
+static void kbdd_drain_serial(void) {
+    for (;;) {
+        int c = serial_poll_char();
+        if (c < 0) {
+            break;
+        }
+        if (c == '\r') {
+            c = '\n';
+        }
+        token_lock(&kbdd.lock);
+        char_ring_push((char)c);
+        token_unlock(&kbdd.lock);
+    }
+}
+
+static void kbdd_drain_input(void) {
+    kbdd_drain_scancodes();
+    kbdd_drain_serial();
+}
+
 static void kbdd_serve_waiters(void) {
     for (;;) {
         uint32_t client = 0;
@@ -130,6 +150,9 @@ static int kbdd_has_work(void) {
     if (keyboard_scancode_pending()) {
         return 1;
     }
+    if (serial_has_char()) {
+        return 1;
+    }
     token_lock(&kbdd.lock);
     /* Waiters alone are not work — block until IRQ delivers a scancode. */
     int work = kbdd.waiter_count > 0 && !char_ring_empty();
@@ -147,7 +170,7 @@ void kbdd_worker(void *arg) {
     (void)arg;
 
     for (;;) {
-        kbdd_drain_scancodes();
+        kbdd_drain_input();
         kbdd_serve_waiters();
 
         struct msg m;
@@ -203,7 +226,7 @@ int kbdd_request_char(void) {
      */
     if (lwkt_in_usersyscall()) {
         for (;;) {
-            kbdd_drain_scancodes();
+            kbdd_drain_input();
 
             char c = 0;
             token_lock(&kbdd.lock);

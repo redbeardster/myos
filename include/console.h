@@ -42,4 +42,8 @@ void console_write_at(unsigned col, unsigned row, const char *str);
 void console_write_dec_at(unsigned col, unsigned row, uint64_t n, int width);
 void console_fill_row(unsigned row, unsigned col_start, unsigned col_end, char c);
 
+/* COM1 input for QEMU -serial stdio automation (returns -1 if empty). */
+int serial_poll_char(void);
+int serial_has_char(void);
+
 #endif

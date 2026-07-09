@@ -50,6 +50,28 @@ static long parse_u32(const char *s, unsigned long *out) {
     return 0;
 }
 
+static long parse_next_u32(const char **s, unsigned long *out) {
+    const char *p = *s;
+    unsigned long v = 0;
+    int seen = 0;
+
+    if (!p) {
+        return -1;
+    }
+    skip_spaces(&p);
+    while (*p >= '0' && *p <= '9') {
+        seen = 1;
+        v = v * 10 + (unsigned long)(*p - '0');
+        p++;
+    }
+    if (!seen) {
+        return -1;
+    }
+    *out = v;
+    *s = p;
+    return 0;
+}
+
 static void write_str(const char *s) {
     myos_write(1, s, str_len(s));
 }
@@ -131,6 +153,9 @@ static void cmd_help(void) {
     write_str("  cpus            - SMP CPU status (per-CPU scheduler)\n");
     write_str("  smpbalance      - per-CPU runner/LWKT distribution\n");
     write_str("  smpbench        - exec spin.elf + SMP snapshot\n");
+    write_str("  ksebench [N] [ITERS] - KSE mutex stress with report\n");
+    write_str("  ksebench compare [N] [ITERS] - mutex vs parallel (KSE)\n");
+    write_str("  schedmode [m]   - get/set sched (0=legacy runner,1=KSE default)\n");
     write_str("  kill <pid>      - kill process by pid (except shell)\n");
     write_str("  killall <name>  - kill all child processes by name\n");
     write_str("  threads         - list LWKT scheduler threads\n");
@@ -215,6 +240,90 @@ static void run_command(char *line) {
         myos_smp_balance();
         myos_threads();
         write_str("[smpbench] done (re-run smpbalance; use kill to stop spin.elf)\n");
+        return;
+    }
+
+    if (str_eq(line, "ksebench") || str_starts(line, "ksebench ")) {
+        unsigned long n = 0;
+        unsigned long iters = 0;
+        unsigned long flags = 0;
+        const char *arg = "";
+
+        if (str_starts(line, "ksebench ")) {
+            arg = line + 9;
+            skip_spaces(&arg);
+        }
+
+        if (str_starts(arg, "compare")) {
+            flags = MYOS_KSEBENCH_ARG_COMPARE;
+            arg += 7;
+            skip_spaces(&arg);
+        }
+
+        if (*arg != '\0') {
+            if (parse_next_u32(&arg, &n) != 0 || n == 0) {
+                write_str("\nusage: ksebench [compare] [workers] [iters]\n");
+                return;
+            }
+            skip_spaces(&arg);
+            if (*arg != '\0') {
+                if (parse_next_u32(&arg, &iters) != 0 || iters == 0) {
+                    write_str("\nusage: ksebench [compare] [workers] [iters]\n");
+                    return;
+                }
+                skip_spaces(&arg);
+                if (*arg != '\0') {
+                    write_str("\nusage: ksebench [compare] [workers] [iters]\n");
+                    return;
+                }
+            }
+        }
+
+        long pid = myos_exec_args("ksebench.elf", n | flags, iters);
+        if (pid < 0) {
+            write_str("\nexec failed: ksebench.elf rc=");
+            write_rc(pid);
+            write_str("\n");
+            return;
+        }
+        write_str("\nStarted process ");
+        write_dec((unsigned long)pid);
+        write_str(" (ksebench.elf");
+        if (flags != 0) {
+            write_str(" compare");
+        }
+        if (n != 0) {
+            write_str(" workers=");
+            write_dec(n);
+        }
+        if (iters != 0) {
+            write_str(" iters=");
+            write_dec(iters);
+        }
+        write_str(")\n");
+        return;
+    }
+
+    if (str_eq(line, "schedmode")) {
+        long mode = myos_proc_get_sched_mode();
+        write_str("\nschedmode=");
+        write_rc(mode);
+        write_str(" (0=legacy runner,1=KSE default)\n");
+        return;
+    }
+
+    if (str_starts(line, "schedmode ")) {
+        const char *arg = line + 10;
+        skip_spaces(&arg);
+        unsigned long m = 0;
+        if (parse_u32(arg, &m) != 0 || (m != 0 && m != 1)) {
+            write_str("\nusage: schedmode [0|1]\n");
+            return;
+        }
+        long rc = myos_proc_set_sched_mode((long)m);
+        write_str("\nschedmode set rc=");
+        write_rc(rc);
+        write_str("\n");
         return;
     }
 

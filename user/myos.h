@@ -43,6 +43,10 @@ static inline long myos_exec(const char *path) {
     return myos_syscall4(MYOS_SYS_EXEC, (long)(uintptr_t)path, 0, 0, 0);
 }
 
+static inline long myos_exec_args(const char *path, unsigned long arg0, unsigned long arg1) {
+    return myos_syscall4(MYOS_SYS_EXEC, (long)(uintptr_t)path, (long)arg0, (long)arg1, 0);
+}
+
 static inline void *myos_alloc_page(void) {
     return (void *)(uintptr_t)myos_syscall4(MYOS_SYS_ALLOC, 0, 0, 0, 0);
 }
@@ -109,6 +113,11 @@ static inline long myos_thread_create(uintptr_t entry, uint64_t arg, long prio) 
     return myos_syscall4(MYOS_SYS_THREAD_CREATE, (long)entry, (long)arg, prio, 0);
 }
 
+static inline long myos_thread_create_ex(uintptr_t entry, uint64_t arg, long prio, long flags) {
+    long packed = (prio & 0xFFFFL) | ((flags & 0xFFFFL) << 16);
+    return myos_syscall4(MYOS_SYS_THREAD_CREATE_EX, (long)entry, (long)arg, packed, 0);
+}
+
 static inline long myos_thread_join(long uthread_id) {
     for (;;) {
         long ret = myos_syscall4(MYOS_SYS_THREAD_JOIN, uthread_id, 0, 0, 0);
@@ -164,7 +173,13 @@ static inline long myos_smp_balance(void) {
 }
 
 static inline long myos_kill(long pid) {
-    return myos_syscall4(MYOS_SYS_KILL, pid, 0, 0, 0);
+    for (;;) {
+        long ret = myos_syscall4(MYOS_SYS_KILL, pid, 0, 0, 0);
+        if (ret != MYOS_ERR_AGAIN) {
+            return ret;
+        }
+        myos_yield();
+    }
 }
 
 static inline long myos_killall(void) {
@@ -173,6 +188,18 @@ static inline long myos_killall(void) {
 
 static inline long myos_killall_name(const char *name) {
     return myos_syscall4(MYOS_SYS_KILLALL_NAME, (long)(uintptr_t)name, 0, 0, 0);
+}
+
+static inline long myos_proc_set_sched_mode(long mode) {
+    return myos_syscall4(MYOS_SYS_PROC_SET_SCHED_MODE, mode, 0, 0, 0);
+}
+
+static inline long myos_proc_get_sched_mode(void) {
+    return myos_syscall4(MYOS_SYS_PROC_GET_SCHED_MODE, 0, 0, 0, 0);
+}
+
+static inline long myos_ticks(void) {
+    return myos_syscall4(MYOS_SYS_TICKS, 0, 0, 0, 0);
 }
 
 #endif

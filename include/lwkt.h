@@ -84,6 +84,9 @@ void lwkt_sched_enable(void);
 void lwkt_sched_ipi_others(void);
 
 struct lwkt_thread *lwkt_create(const char *name, void (*entry)(void *), void *arg, uint32_t priority);
+struct lwkt_thread *lwkt_create_user(const char *name, void (*entry)(void *), void *arg,
+                                     uint32_t priority, struct proc *user_p,
+                                     struct uthread *bind_u);
 int lwkt_destroy(uint32_t id);
 struct lwkt_thread *lwkt_find(uint32_t id);
 void lwkt_list(void);
@@ -94,6 +97,7 @@ void lwkt_switch(void);
 void lwkt_yield(void);
 void lwkt_block(void);
 void lwkt_unblock(struct lwkt_thread *t);
+void lwkt_nudge(struct lwkt_thread *t);
 void lwkt_preempt_request(void);
 void lwkt_preempt_check(void);
 void lwkt_timer_tick(void);

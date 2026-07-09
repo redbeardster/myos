@@ -7,7 +7,7 @@ extern main
 
 section .text
 _start:
-    xor rdi, rdi
+    ; rdi = exec arg0 packed by kernel (0 if unset)
     xor rsi, rsi
     call main
 

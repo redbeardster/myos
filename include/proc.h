@@ -21,6 +21,11 @@ enum proc_state {
     PROC_DEAD = 1
 };
 
+enum proc_sched_mode {
+    PROC_SCHED_RUNNER = 0,
+    PROC_SCHED_KSE = 1
+};
+
 struct proc {
     uint32_t pid;
     char name[32];
@@ -31,6 +36,7 @@ struct proc {
     uint64_t heap_next;
     uint64_t stack_next;
     int is_shell;
+    uint32_t sched_mode;
     int uthread_count;
     struct uthread *threads;
     struct uthread *main_thread;
@@ -51,9 +57,12 @@ void proc_detach_uthread(struct proc *p, struct uthread *u);
 void proc_on_uthread_exit(struct proc *p, struct uthread *u);
 int proc_start_runner(struct proc *p, uint32_t lwkt_priority);
 void proc_runner_resched(struct proc *p);
+void proc_sched_nudge(struct proc *p);
 void proc_destroy(struct proc *p);
 int proc_kill(uint32_t pid);
 int proc_kill_name(const char *name);
+int proc_set_sched_mode(struct proc *p, uint32_t mode);
+int proc_get_sched_mode(struct proc *p);
 void proc_kill_all(void);
 void proc_kill_children(void);
 void proc_list(void);

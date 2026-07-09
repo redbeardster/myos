@@ -37,6 +37,10 @@
 #define SYS_KILL            MYOS_SYS_KILL
 #define SYS_KILLALL         MYOS_SYS_KILLALL
 #define SYS_KILLALL_NAME    MYOS_SYS_KILLALL_NAME
+#define SYS_PROC_SET_SCHED_MODE MYOS_SYS_PROC_SET_SCHED_MODE
+#define SYS_PROC_GET_SCHED_MODE MYOS_SYS_PROC_GET_SCHED_MODE
+#define SYS_THREAD_CREATE_EX    MYOS_SYS_THREAD_CREATE_EX
+#define SYS_TICKS               MYOS_SYS_TICKS
 
 void syscall_init(void);
 uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,

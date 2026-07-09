@@ -157,20 +157,20 @@ Syscall / interrupt (TSS.RSP0)
 
 ```
 exec_spawn_elf()
-  → proc_create(cr3, …)
-  → uthread_spawn_in_proc()     # uthread в run_queue proc
-  → proc_start_runner()         # LWKT pN, proc_runner_entry
+  → proc_create(cr3, …)          # sched_mode = PROC_SCHED_KSE (default)
+  → uthread_spawn_in_proc()      # main uthread + lwkt_create_user(user_kse_entry)
+  → [legacy] proc_start_runner() # только при PROC_SCHED_RUNNER (schedmode 0)
 
 user: SYS_EXIT
   → uthread_exit()
   → uthread_cleanup() → proc_on_uthread_exit() → proc_destroy (при последнем uthread)
-  → runner LWKT: lwkt_thread_exit() → lwkt_yield()
+  → KSE LWKT: lwkt_thread_exit() → lwkt_yield()
 ```
 
 Инварианты:
 
 - `SYS_EXIT` не возвращается в syscall stub (`__builtin_unreachable`).
-- Syscall выполняется на **kernel stack runner LWKT**; из syscall **нельзя** `lwkt_switch()` —
+- Syscall выполняется на **kernel stack KSE LWKT** (или runner LWKT в legacy mode); из syscall **нельзя** `lwkt_switch()` —
   см. `in_syscall`, `lwkt_syscall_wait_edge()` в [PROC_RUNNER.md](PROC_RUNNER.md) §4.
 - `SYS_READ` в user proc: poll клавиатуры + `lwkt_syscall_wait_edge()`, не msgport block.
 - После exit LWKT-слот: `id = 0`, `msgport_clear_slot()` в `lwkt_thread_exit()`.
@@ -180,8 +180,9 @@ user: SYS_EXIT
 
 - Один proc — несколько uthread; у каждого свой user stack (`user_stack_alloc`).
 - `SYS_THREAD_CREATE` / `JOIN` / mutex — см. [THREADS_DEMO.md](THREADS_DEMO.md).
-- **In-proc scheduler** (`proc_sched_pick`, `run_queue`); runner — один LWKT на proc.
-- `uthread_yield` из syscall переключает uthread внутри proc; при отсутствии peer — `hlt`.
+- **Default (KSE):** каждый uthread — отдельный kernel LWKT (`user_kse_entry`); SMP scheduler выбирает uthread напрямую.
+- **Legacy (`schedmode 0`):** in-proc scheduler (`proc_sched_pick`, `run_queue`); один runner LWKT на proc.
+- `uthread_yield` из syscall переключает KSE LWKT (или uthread внутри proc в runner mode); при отсутствии peer — `hlt`.
 
 ### Вытесняющая многозадачность (LWKT)
 
@@ -247,6 +248,28 @@ SYS_KILL / SYS_KILLALL_NAME
 - В `syscall_post_dispatch` нельзя преждевременно очищать `pending_kill` до перехода в runner.
 
 Детальная схема с кодом и моделью памяти: [PROC_RUNNER.md](PROC_RUNNER.md) §8.2.
+
+---
+
+## 6.2. Scheduling mode (KSE default)
+
+По умолчанию все user uthread — kernel-schedulable (KSE):
+
+- `PROC_SCHED_KSE` (default): каждый uthread — отдельный LWKT, планируется SMP scheduler.
+- `PROC_SCHED_RUNNER` (legacy/debug): один runner LWKT на proc, in-proc `run_queue`.
+
+Syscall:
+
+- `SYS_PROC_SET_SCHED_MODE`, `SYS_PROC_GET_SCHED_MODE`
+- `SYS_THREAD_CREATE_EX` (совместимость; флаги игнорируются в KSE mode)
+
+Userland:
+
+- `myos_proc_set_sched_mode(0)` — legacy runner
+- shell: `schedmode [0|1]`
+- `ksebench`, `ksebench compare` — stress/benchmark для KSE
+
+Детали: [PROC_RUNNER.md](PROC_RUNNER.md) §10.
 
 ---
 

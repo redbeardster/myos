@@ -3,6 +3,7 @@
 #include "console.h"
 #include "cpu.h"
 #include "exec.h"
+#include "interrupt.h"
 #include "keyboard.h"
 #include "kbdd.h"
 #include "lwkt.h"
@@ -28,6 +29,38 @@ static void syscall_stash_user_callee(struct uthread *u, uint64_t rbx, uint64_t 
     u->user_r14 = r14;
     u->user_r15 = r15;
     u->user_regs_valid = 1;
+}
+
+/* Per-LWKT uthread for KSE; proc->current_uthread only for legacy runner. */
+static struct uthread *syscall_uthread(struct lwkt_thread *cur) {
+    if (!cur) {
+        return NULL;
+    }
+    if (cur->uthread && cur->uthread->type == UTHREAD_USER) {
+        return cur->uthread;
+    }
+    if (cur->user_proc && cur->user_proc->sched_mode == PROC_SCHED_RUNNER) {
+        return cur->user_proc->current_uthread;
+    }
+    return NULL;
+}
+
+static void syscall_stash_user_ctx(struct lwkt_thread *cur, uint64_t user_rip, uint64_t user_rsp,
+                                   uint64_t a1, uint64_t user_rbx, uint64_t user_rbp,
+                                   uint64_t user_r12, uint64_t user_r13, uint64_t user_r14,
+                                   uint64_t user_r15) {
+    struct uthread *u = syscall_uthread(cur);
+    if (!u) {
+        return;
+    }
+    syscall_stash_user_callee(u, user_rbx, user_rbp, user_r12, user_r13, user_r14, user_r15);
+    if (user_rip >= MYOS_USER_BASE && user_rip < MYOS_USER_LIMIT) {
+        u->user_rip = user_rip;
+    }
+    if (user_rsp >= MYOS_USER_STACK_BASE && user_rsp < MYOS_USER_STACK_TOP) {
+        u->user_rsp = user_rsp;
+    }
+    u->user_rdi = a1;
 }
 
 static int copy_from_user_safe(char *dst, const char *src, uint64_t len) {
@@ -111,7 +144,7 @@ static int sys_read(uint64_t fd) {
     return c;
 }
 
-static int sys_exec(const char *name) {
+static int sys_exec(const char *name, uint64_t arg0, uint64_t arg1) {
     char path[64];
     if (copy_user_string(path, name, sizeof(path)) != 0) {
         return -2;
@@ -119,7 +152,7 @@ static int sys_exec(const char *name) {
     if (path[0] == '\0') {
         return -2;
     }
-    return exec_spawn_module(path, 0);
+    return exec_spawn_module(path, 0, arg0, arg1);
 }
 
 static int syscall_msg_receive(struct msg *out, int block) {
@@ -172,20 +205,8 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
     struct lwkt_thread *cur = lwkt_curthread();
     if (cur) {
         cur->in_syscall = 1;
-        if (cur->user_proc && cur->user_proc->current_uthread) {
-            struct uthread *u = cur->user_proc->current_uthread;
-            if (uthread_ptr_valid(u)) {
-                syscall_stash_user_callee(u, user_rbx, user_rbp, user_r12, user_r13,
-                                          user_r14, user_r15);
-                if (user_rip >= MYOS_USER_BASE && user_rip < MYOS_USER_LIMIT) {
-                    u->user_rip = user_rip;
-                }
-                if (user_rsp >= MYOS_USER_STACK_BASE && user_rsp < MYOS_USER_STACK_TOP) {
-                    u->user_rsp = user_rsp;
-                }
-                u->user_rdi = a1;
-            }
-        }
+        syscall_stash_user_ctx(cur, user_rip, user_rsp, a1, user_rbx, user_rbp, user_r12,
+                               user_r13, user_r14, user_r15);
     }
 
     uint64_t ret = 0;
@@ -209,7 +230,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
             break;
 
         case SYS_EXEC:
-            ret = (uint64_t)(int64_t)sys_exec((const char *)(uintptr_t)a1);
+            ret = (uint64_t)(int64_t)sys_exec((const char *)(uintptr_t)a1, a2, a3);
             break;
 
         case SYS_YIELD:
@@ -323,6 +344,22 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 prio = (uint32_t)a3;
             }
             ret = (uint64_t)(int64_t)uthread_create_in_proc(p, a1, a2, prio);
+            break;
+        }
+
+        case SYS_THREAD_CREATE_EX: {
+            struct proc *p = proc_current();
+            if (!p) {
+                ret = (uint64_t)-1;
+                break;
+            }
+            uint32_t packed = (uint32_t)a3;
+            uint32_t prio = packed & 0xFFFFU;
+            uint32_t flags = (packed >> 16) & 0xFFFFU;
+            if (prio >= MAX_PRIORITY) {
+                prio = LWKT_PRIO_NORMAL;
+            }
+            ret = (uint64_t)(int64_t)uthread_create_in_proc_ex(p, a1, a2, prio, flags);
             break;
         }
 
@@ -470,6 +507,30 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
             break;
         }
 
+        case SYS_PROC_SET_SCHED_MODE: {
+            struct proc *p = proc_current();
+            if (!p) {
+                ret = (uint64_t)-1;
+                break;
+            }
+            ret = (uint64_t)(int64_t)proc_set_sched_mode(p, (uint32_t)a1);
+            break;
+        }
+
+        case SYS_PROC_GET_SCHED_MODE: {
+            struct proc *p = proc_current();
+            if (!p) {
+                ret = (uint64_t)-1;
+                break;
+            }
+            ret = (uint64_t)(int64_t)proc_get_sched_mode(p);
+            break;
+        }
+
+        case SYS_TICKS:
+            ret = (uint64_t)(int64_t)timer_get_ticks();
+            break;
+
         default:
             ret = (uint64_t)-1;
             break;
@@ -487,7 +548,10 @@ uint64_t syscall_post_dispatch(uint64_t ret) {
             runner_longjmp(&cur->runner_jmp, 1);
         }
         if (cur->runner_reswitch) {
-            cur->runner_reswitch = 0;
+            /*
+             * Leave runner_reswitch set: user_kse_entry / proc_runner_entry
+             * clear it after longjmp (KSE yields there; runner picks next uthread).
+             */
             cur->in_syscall = 0;
             runner_longjmp(&cur->runner_jmp, 1);
         }

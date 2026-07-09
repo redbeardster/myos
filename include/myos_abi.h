@@ -52,6 +52,10 @@
 #define MYOS_SYS_KILL            30
 #define MYOS_SYS_KILLALL         31
 #define MYOS_SYS_KILLALL_NAME    32
+#define MYOS_SYS_PROC_SET_SCHED_MODE 33
+#define MYOS_SYS_PROC_GET_SCHED_MODE 34
+#define MYOS_SYS_THREAD_CREATE_EX    35
+#define MYOS_SYS_TICKS               36
 
 #define MYOS_PROC_MUTEX_MAX    8
 
@@ -70,5 +74,13 @@
 #define MYOS_CAP_MAX 32
 #define MYOS_CAP_RIGHT_SEND 0x1
 #define MYOS_CAP_RIGHT_RECV 0x2
+
+#define MYOS_PROC_SCHED_RUNNER 0
+#define MYOS_PROC_SCHED_KSE    1
+
+#define MYOS_THREAD_F_KSE      0x1
+
+/* exec arg0 flag for ksebench compare mode (bits 16+ of arg0, before packing). */
+#define MYOS_KSEBENCH_ARG_COMPARE (1UL << 16)
 
 #endif

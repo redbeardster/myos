@@ -33,11 +33,23 @@ static inline long myos_mutex_unlock_default(void) {
 }
 
 static inline long myos_thread_spawn(myos_thread_fn fn, uint64_t arg) {
-    return myos_thread_create((uintptr_t)fn, arg, MYOS_THREAD_PRIO_NORMAL);
+    long tid = myos_thread_create((uintptr_t)fn, arg, MYOS_THREAD_PRIO_NORMAL);
+    if (tid >= 0) {
+        myos_yield();
+    }
+    return tid;
 }
 
 static inline long myos_thread_spawn_prio(myos_thread_fn fn, uint64_t arg, long prio) {
-    return myos_thread_create((uintptr_t)fn, arg, prio);
+    long tid = myos_thread_create((uintptr_t)fn, arg, prio);
+    if (tid >= 0) {
+        myos_yield();
+    }
+    return tid;
+}
+
+static inline long myos_thread_spawn_kse(myos_thread_fn fn, uint64_t arg, long prio) {
+    return myos_thread_create_ex((uintptr_t)fn, arg, prio, MYOS_THREAD_F_KSE);
 }
 
 #endif

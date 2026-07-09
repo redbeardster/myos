@@ -27,10 +27,11 @@ int proc_mutex_lock_slot(struct proc_mutex *mutexes, int count, uint32_t id) {
     struct proc *p = proc_current();
     struct uthread *u = uthread_current();
     struct lwkt_thread *self = lwkt_curthread();
+    int user_can_retry = p && u && lwkt_in_usersyscall() && u->lwkt == self;
 
     if (tok->holder == self && mutexes[id].uthread_holder != NULL &&
         mutexes[id].uthread_holder != u) {
-        if (p && p->runner == self && u && lwkt_in_usersyscall()) {
+        if (user_can_retry) {
             uthread_yield();
             return MYOS_ERR_AGAIN;
         }
@@ -44,7 +45,7 @@ int proc_mutex_lock_slot(struct proc_mutex *mutexes, int count, uint32_t id) {
         return 0;
     }
 
-    if (p && p->runner == self && u && lwkt_in_usersyscall()) {
+    if (user_can_retry) {
         uthread_yield();
         return MYOS_ERR_AGAIN;
     }
@@ -64,13 +65,19 @@ int proc_mutex_unlock_slot(struct proc_mutex *mutexes, int count, uint32_t id) {
     }
     mutexes[id].uthread_holder = NULL;
     token_unlock(&mutexes[id].lock);
-    proc_runner_resched(proc_current());
+    proc_sched_nudge(proc_current());
     return 0;
 }
 
 void proc_mutex_abandon_all(struct proc_mutex *mutexes, int count, struct uthread *u) {
-    struct lwkt_thread *runner = u && u->proc ? u->proc->runner : NULL;
-    if (!mutexes || !runner) {
+    struct lwkt_thread *owner = NULL;
+    if (u) {
+        owner = u->lwkt;
+        if (!owner && u->proc) {
+            owner = u->proc->runner;
+        }
+    }
+    if (!mutexes || !owner) {
         return;
     }
     if (count > PROC_MUTEX_MAX) {
@@ -78,7 +85,7 @@ void proc_mutex_abandon_all(struct proc_mutex *mutexes, int count, struct uthrea
     }
     for (int i = 0; i < count; i++) {
         if (mutexes[i].uthread_holder == u) {
-            token_drop_holder(&mutexes[i].lock, runner);
+            token_drop_holder(&mutexes[i].lock, owner);
             mutexes[i].uthread_holder = NULL;
         }
     }

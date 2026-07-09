@@ -68,10 +68,33 @@ static void enqueue_on_cpu_head(struct cpu *cpu, struct lwkt_thread *t) {
     cpu->run_queues[p] = t;
 }
 
-static struct cpu *pick_enqueue_cpu(void);
+static struct cpu *pick_enqueue_cpu(struct uthread *bind_u) {
+    struct cpu *cpu = this_cpu();
+    if (!cpu) {
+        return cpu_by_id(0);
+    }
+
+    struct lwkt_thread *cur = lwkt_curthread();
+    if (bind_u && bind_u->type == UTHREAD_USER && cur && cur->uthread && cur->in_syscall &&
+        bind_u->proc && cur->uthread->proc == bind_u->proc) {
+        return cpu;
+    }
+
+    if (cur && cur->in_syscall) {
+        uint32_t n = cpu_online_count();
+        for (uint32_t i = 1; i < n; i++) {
+            struct cpu *other = cpu_by_id((cpu->id + i) % n);
+            if (other && other->online) {
+                return other;
+            }
+        }
+    }
+    return cpu;
+}
 
 static void enqueue_thread(struct lwkt_thread *t) {
-    struct cpu *cpu = pick_enqueue_cpu();
+    struct uthread *bind_u = t ? t->uthread : NULL;
+    struct cpu *cpu = pick_enqueue_cpu(bind_u);
     if (!cpu) {
         cpu = cpu_by_id(0);
     }
@@ -151,7 +174,7 @@ static struct lwkt_thread *dequeue_thread(struct cpu *cpu, struct lwkt_thread *s
         skip_fallback = 0;
     }
 
-    struct lwkt_thread *t = dequeue_from_cpu(cpu, skip, skip_fallback);
+    struct lwkt_thread *t = dequeue_from_cpu(cpu, skip, 0);
     if (t) {
         if (skip && skip->quantum_force && t != skip) {
             skip->quantum_force = 0;
@@ -161,6 +184,36 @@ static struct lwkt_thread *dequeue_thread(struct cpu *cpu, struct lwkt_thread *s
 
     if (skip && skip->quantum_force) {
         skip->quantum_force = 0;
+    }
+
+    /*
+     * skip_fallback on a CPU that only has the yielding thread lets it spin
+     * while sibling uthreads sit on other CPUs — pull same-proc peers first.
+     */
+    if (skip && skip->uthread && skip->uthread->proc) {
+        struct proc *proc = skip->uthread->proc;
+        for (uint32_t i = 0; i < cpu_online_count(); i++) {
+            struct cpu *other = cpu_by_id(i);
+            if (!other || !other->online || other == cpu) {
+                continue;
+            }
+            t = dequeue_from_cpu(other, NULL, 0);
+            if (!t) {
+                continue;
+            }
+            if (t->uthread && t->uthread->proc == proc) {
+                t->run_cpu = cpu->id;
+                return t;
+            }
+            enqueue_on_cpu(other, t);
+        }
+    }
+
+    if (skip_fallback) {
+        t = dequeue_from_cpu(cpu, skip, 1);
+        if (t) {
+            return t;
+        }
     }
 
     /* Work steal: idle CPU pulls from another CPU's queue. */
@@ -230,25 +283,6 @@ static int idle_should_yield(struct cpu *cpu) {
     int wake = cpu_has_ready_peer(cpu) || any_cpu_has_ready_user_runner();
     spin_unlock(&sched_lock);
     return wake;
-}
-
-static struct cpu *pick_enqueue_cpu(void) {
-    struct cpu *cpu = this_cpu();
-    if (!cpu) {
-        return cpu_by_id(0);
-    }
-
-    struct lwkt_thread *cur = cpu->current;
-    if (cur && cur->in_syscall) {
-        uint32_t n = cpu_online_count();
-        for (uint32_t i = 1; i < n; i++) {
-            struct cpu *other = cpu_by_id((cpu->id + i) % n);
-            if (other && other->online) {
-                return other;
-            }
-        }
-    }
-    return cpu;
 }
 
 static void strcpy_local(char *dst, const char *src) {
@@ -614,7 +648,7 @@ void lwkt_ipc_bump(struct lwkt_thread *t) {
     sched_lock_irqsave(&irqf);
     if (t->state == THREAD_READY) {
         remove_from_queues(t);
-        enqueue_on_cpu_head(pick_enqueue_cpu(), t);
+        enqueue_on_cpu_head(pick_enqueue_cpu(NULL), t);
     }
     sched_unlock_irqrestore(irqf);
     ipc_bump_applied++;
@@ -628,18 +662,9 @@ int lwkt_ipc_bump_mode(int mode) {
     return ipc_bump_enabled;
 }
 
-struct lwkt_thread *lwkt_create(const char *name, void (*entry)(void *), void *arg, uint32_t priority) {
-    if (priority >= MAX_PRIORITY) {
-        priority = MAX_PRIORITY - 1;
-    }
-
-    uint64_t irqf;
-    sched_lock_irqsave(&irqf);
-    if (thread_count >= MAX_THREADS) {
-        sched_unlock_irqrestore(irqf);
-        return NULL;
-    }
-
+static struct lwkt_thread *lwkt_create_locked(const char *name, void (*entry)(void *), void *arg,
+                                              uint32_t priority, struct proc *user_p,
+                                              struct uthread *bind_u) {
     struct lwkt_thread *t = NULL;
     for (int i = 0; i < MAX_THREADS; i++) {
         if (thread_pool[i].id == 0) {
@@ -648,7 +673,6 @@ struct lwkt_thread *lwkt_create(const char *name, void (*entry)(void *), void *a
         }
     }
     if (!t) {
-        sched_unlock_irqrestore(irqf);
         return NULL;
     }
 
@@ -668,13 +692,10 @@ struct lwkt_thread *lwkt_create(const char *name, void (*entry)(void *), void *a
     t->state = THREAD_READY;
     t->entry_point = entry;
     t->arg = arg;
-    t->uthread = NULL;
-    t->user_proc = NULL;
     t->next = NULL;
     t->run_cpu = 0;
     t->last_cpu_executed = (uint32_t)-1;
     t->cpu_migrations = 0;
-    t->user_cr3 = 0;
     t->pending_cr3_destroy = 0;
     t->yields = 0;
     t->quantum_expired = 0;
@@ -691,10 +712,71 @@ struct lwkt_thread *lwkt_create(const char *name, void (*entry)(void *), void *a
     t->wait_next = NULL;
     t->mbox_wait_next = NULL;
     t->mbox_slot = (uint8_t)((t - thread_pool) + 1);
+
+    if (user_p) {
+        t->user_proc = user_p;
+        t->user_cr3 = user_p->cr3;
+    } else {
+        t->user_proc = NULL;
+        t->user_cr3 = 0;
+    }
+
+    if (bind_u) {
+        t->uthread = bind_u;
+        bind_u->lwkt = t;
+        bind_u->uthread_id = t->id;
+        bind_u->state = UTHREAD_RUNNABLE;
+    } else {
+        t->uthread = NULL;
+    }
+
     init_thread_stack(t);
     enqueue_thread(t);
     thread_count++;
+    return t;
+}
+
+struct lwkt_thread *lwkt_create(const char *name, void (*entry)(void *), void *arg, uint32_t priority) {
+    if (priority >= MAX_PRIORITY) {
+        priority = MAX_PRIORITY - 1;
+    }
+
+    uint64_t irqf;
+    sched_lock_irqsave(&irqf);
+    if (thread_count >= MAX_THREADS) {
+        sched_unlock_irqrestore(irqf);
+        return NULL;
+    }
+
+    struct lwkt_thread *t = lwkt_create_locked(name, entry, arg, priority, NULL, NULL);
     sched_unlock_irqrestore(irqf);
+    if (!t) {
+        return NULL;
+    }
+
+    lwkt_sched_ipi_others();
+    return t;
+}
+
+struct lwkt_thread *lwkt_create_user(const char *name, void (*entry)(void *), void *arg,
+                                     uint32_t priority, struct proc *user_p,
+                                     struct uthread *bind_u) {
+    if (priority >= MAX_PRIORITY) {
+        priority = MAX_PRIORITY - 1;
+    }
+
+    uint64_t irqf;
+    sched_lock_irqsave(&irqf);
+    if (thread_count >= MAX_THREADS) {
+        sched_unlock_irqrestore(irqf);
+        return NULL;
+    }
+
+    struct lwkt_thread *t = lwkt_create_locked(name, entry, arg, priority, user_p, bind_u);
+    sched_unlock_irqrestore(irqf);
+    if (!t) {
+        return NULL;
+    }
 
     lwkt_sched_ipi_others();
     return t;
@@ -905,7 +987,7 @@ void lwkt_list(void) {
 }
 
 void lwkt_smp_balance(void) {
-    console_writestring("\nSMP balance (1 runner LWKT per user process):\n");
+    console_writestring("\nSMP balance (KSE user uthreads per LWKT):\n");
     console_writestring("CPU  Switches   Current          Runners(run/rdy)  LWKT-ready\n");
     console_writestring("---  ---------  ---------------  ----------------  ----------\n");
 
@@ -954,8 +1036,8 @@ void lwkt_smp_balance(void) {
     sched_unlock_irqrestore(irqf);
 
     console_writestring(
-        "\nNote: uthreads inside one process share a single runner; "
-        "more CPUs help when there are multiple runners (processes).\n");
+        "\nNote: each user uthread is a schedulable LWKT (KSE); "
+        "more CPUs help parallel uthreads across processes.\n");
 }
 
 struct lwkt_thread *lwkt_curthread(void) {
@@ -968,12 +1050,44 @@ int lwkt_in_usersyscall(void) {
     return cur && cur->in_syscall;
 }
 
+static int sched_has_ready_other(struct lwkt_thread *skip) {
+    uint64_t irqf;
+    sched_lock_irqsave(&irqf);
+    for (uint32_t i = 0; i < cpu_online_count(); i++) {
+        struct cpu *c = cpu_by_id(i);
+        if (!c || !c->online) {
+            continue;
+        }
+        for (uint32_t p = 0; p < MAX_PRIORITY; p++) {
+            int guard = 0;
+            for (struct lwkt_thread *t = c->run_queues[p];
+                 t && guard < MAX_THREADS;
+                 t = t->next, guard++) {
+                if (t == skip || t == &c->idle || t->state != THREAD_READY) {
+                    continue;
+                }
+                sched_unlock_irqrestore(irqf);
+                return 1;
+            }
+        }
+    }
+    sched_unlock_irqrestore(irqf);
+    return 0;
+}
+
 void lwkt_syscall_wait_edge(void) {
     /*
-     * Never lwkt_yield() from here: int 0x80 runs on syscall_stack (TSS.RSP0).
-     * Do not IPI on every poll either — that wakes all APs in a tight loop
-     * while shell waits for keyboard and can starve the BSP.
+     * int 0x80 uses syscall_stack — not safe to lwkt_switch() here.
+     * KSE user threads with an active runner_setjmp longjmp back and
+     * lwkt_yield() when other LWKTs are runnable (SMP=1 shell READ).
      */
+    struct lwkt_thread *cur = lwkt_curthread();
+    if (cur && cur->uthread && cur->uthread->type == UTHREAD_USER &&
+        cur->runner_jmp.rsp != 0 && sched_has_ready_other(cur)) {
+        cur->runner_reswitch = 1;
+        cur->in_syscall = 0;
+        runner_longjmp(&cur->runner_jmp, 1);
+    }
     __asm__ volatile("sti; hlt" ::: "memory");
 }
 
@@ -1092,6 +1206,10 @@ void lwkt_preempt_check(void) {
 
     if (cur != &cpu->idle && cur->pending_kill && !cur->in_syscall) {
         cpu->preempt_requested = 0;
+        if (cur->uthread && cur->uthread->type == UTHREAD_USER) {
+            cur->runner_reswitch = 1;
+            runner_longjmp(&cur->runner_jmp, 1);
+        }
         if (cur->user_proc) {
             cur->runner_reswitch = 1;
             runner_longjmp(&cur->runner_jmp, 1);
@@ -1281,6 +1399,30 @@ void lwkt_unblock(struct lwkt_thread *t) {
     lwkt_sched_ipi_others();
 }
 
+void lwkt_nudge(struct lwkt_thread *t) {
+    if (!t || t->state == THREAD_TERMINATED) {
+        return;
+    }
+
+    uint64_t irqf;
+    sched_lock_irqsave(&irqf);
+    if (t->state == THREAD_BLOCKED) {
+        t->state = THREAD_READY;
+        enqueue_thread(t);
+    } else if (t->state == THREAD_READY) {
+        remove_from_queues(t);
+        struct cpu *c = cpu_by_id(t->run_cpu);
+        if (!c || !c->online) {
+            c = this_cpu();
+        }
+        if (c) {
+            enqueue_on_cpu_head(c, t);
+        }
+    }
+    sched_unlock_irqrestore(irqf);
+    lwkt_sched_ipi_others();
+}
+
 void lwkt_thread_exit(void) {
     struct cpu *cpu = this_cpu();
     if (cpu && cpu->current) {
@@ -1292,6 +1434,8 @@ void lwkt_thread_exit(void) {
         msgport_unregister_id(cpu->current->id);
         cpu->current->state = THREAD_TERMINATED;
         cpu->current->entry_point = NULL;
+        cpu->current->pending_kill = 0;
+        cpu->current->in_syscall = 0;
         cpu->current->id = 0;
         thread_count--;
     }

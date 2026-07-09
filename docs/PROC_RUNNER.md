@@ -285,6 +285,7 @@ user shell: kill / killall <name>
 - `uthread_yield`: если `runner->pending_kill`, принудительно `uthread_return_to_runner(p)`.
 - `lwkt_preempt_check`/`lwkt_yield`: для user-runner с `pending_kill` делается `runner_longjmp`.
 - `proc_runner_entry`: при входе в loop проверяет `runner->pending_kill`, затем `proc_destroy(p)` и `lwkt_thread_exit()`.
+- `lwkt_thread_exit`: перед `lwkt_yield()` сбрасывает `cpu->current->pending_kill = 0`, чтобы исключить рекурсивный цикл `lwkt_yield -> pending_kill -> lwkt_thread_exit` для service LWKT.
 
 Почему раньше kill "частично" не завершался:
 
@@ -310,3 +311,35 @@ user shell: kill / killall <name>
 - [ARCHITECTURE_AUDIT.md](ARCHITECTURE_AUDIT.md) — полный аудит, история багов, инварианты
 - DragonFly (референс, не копировать): `sys/kern/usched_dfly.c`, token sleep
 - Локально: `/home/redbeard/dsk_250/DragonFlyBSD` (если доступен)
+
+---
+
+## 10. KSE scheduling (default)
+
+Все новые процессы создаются в режиме `PROC_SCHED_KSE`:
+
+- каждый uthread (включая `main` после `exec`) получает свой LWKT через `lwkt_create_user(..., user_kse_entry, ...)`,
+- SMP scheduler планирует uthread напрямую, без промежуточного proc-runner.
+
+Legacy runner (`PROC_SCHED_RUNNER`) сохранён для отладки:
+
+- `schedmode 0` / `myos_proc_set_sched_mode(MYOS_PROC_SCHED_RUNNER)`
+- один runner LWKT на proc, in-proc `run_queue`, `proc_runner_entry`.
+
+ABI/API:
+
+- `MYOS_SYS_PROC_SET_SCHED_MODE`, `MYOS_SYS_PROC_GET_SCHED_MODE`
+- `MYOS_SYS_THREAD_CREATE_EX` (совместимость)
+- `MYOS_SYS_TICKS` — монотонный счётчик таймера
+
+Userland:
+
+- `myos_proc_set_sched_mode(mode)` / `myos_proc_get_sched_mode()`
+- `myos_thread_create_ex(entry,arg,prio,flags)` → делегирует в `myos_thread_create` в KSE mode
+- shell: `schedmode [0|1]`, `ksebench [N] [ITERS]`, `ksebench compare [N] [ITERS]`
+
+Инварианты:
+
+- kill: `pending_kill` на всех LWKT процесса, cooperative teardown.
+- KSE uthread не попадает в runner `run_queue` (`runner_queue=0`).
+- CR3/TSS/`in_syscall` инварианты сохраняются при `lwkt_create_user`.

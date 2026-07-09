@@ -52,14 +52,16 @@ static const char *base_name(const char *path) {
     return base;
 }
 
-static int spawn_from_blob(const void *elf, size_t size, const char *name, uint32_t flags) {
+static int spawn_from_blob(const void *elf, size_t size, const char *name, uint32_t flags,
+                           uint64_t exec_arg0, uint64_t exec_arg1) {
     if (!elf || size == 0) {
         return -1;
     }
-    return exec_spawn_elf(elf, size, name, flags);
+    return exec_spawn_elf(elf, size, name, flags, exec_arg0, exec_arg1);
 }
 
-int exec_spawn_elf(const void *elf, size_t size, const char *name, uint32_t flags) {
+int exec_spawn_elf(const void *elf, size_t size, const char *name, uint32_t flags,
+                   uint64_t exec_arg0, uint64_t exec_arg1) {
     struct elf_load_info info;
     int is_shell = (flags & EXEC_FLAG_SHELL) != 0;
 
@@ -94,18 +96,22 @@ int exec_spawn_elf(const void *elf, size_t size, const char *name, uint32_t flag
     }
     p->user_stack = user_rsp;
 
-    uint32_t uthread_prio = LWKT_PRIO_NORMAL;
-    uint32_t runner_prio = LWKT_PRIO_HIGH;
-    struct uthread *u = uthread_spawn_in_proc(p, info.entry, user_rsp, 0, stack_base, uthread_prio);
+    uint64_t uthread_prio = LWKT_PRIO_NORMAL;
+    uint64_t packed = ((exec_arg0 & 0xFFFFFFFFULL) << 32) | (exec_arg1 & 0xFFFFFFFFULL);
+    struct uthread *u = uthread_spawn_in_proc(p, info.entry, user_rsp, packed, stack_base,
+                                              (uint32_t)uthread_prio);
     if (!u) {
         user_stack_free(p, stack_base);
         proc_destroy(p);
         return -6;
     }
 
-    if (proc_start_runner(p, runner_prio) != 0) {
-        proc_destroy(p);
-        return -8;
+    if (p->sched_mode == PROC_SCHED_RUNNER) {
+        uint32_t runner_prio = LWKT_PRIO_HIGH;
+        if (proc_start_runner(p, runner_prio) != 0) {
+            proc_destroy(p);
+            return -8;
+        }
     }
 
     lwkt_sched_ipi_others();
@@ -136,7 +142,8 @@ void exec_list_modules(void) {
     }
 }
 
-int exec_spawn_module(const char *name, uint32_t flags) {
+int exec_spawn_module(const char *name, uint32_t flags,
+                      uint64_t exec_arg0, uint64_t exec_arg1) {
     if (module_request.response) {
         for (uint64_t i = 0; i < module_request.response->module_count; i++) {
             struct limine_file *m = module_request.response->modules[i];
@@ -146,7 +153,7 @@ int exec_spawn_module(const char *name, uint32_t flags) {
 
             if (path_ends_with(m->path, name)) {
                 const char *pname = base_name(m->path);
-                return exec_spawn_elf(m->address, m->size, pname, flags);
+                return exec_spawn_elf(m->address, m->size, pname, flags, exec_arg0, exec_arg1);
             }
         }
     }
@@ -155,7 +162,7 @@ int exec_spawn_module(const char *name, uint32_t flags) {
     if (emb) {
         size_t size = user_embed_size(emb);
         if (size > 0) {
-            return spawn_from_blob(emb->start, size, emb->name, flags);
+            return spawn_from_blob(emb->start, size, emb->name, flags, exec_arg0, exec_arg1);
         }
     }
 
@@ -163,5 +170,5 @@ int exec_spawn_module(const char *name, uint32_t flags) {
 }
 
 int exec_start_shell(void) {
-    return exec_spawn_module("shell.elf", EXEC_FLAG_SHELL);
+    return exec_spawn_module("shell.elf", EXEC_FLAG_SHELL, 0, 0);
 }
