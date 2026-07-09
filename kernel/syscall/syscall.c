@@ -32,7 +32,18 @@ static void syscall_stash_user_callee(struct uthread *u, uint64_t rbx, uint64_t 
 
 static int copy_from_user_safe(char *dst, const char *src, uint64_t len) {
     uint64_t s = (uint64_t)(uintptr_t)src;
-    if (s < MYOS_USER_BASE || s + len > MYOS_USER_STACK_TOP || s + len < s) {
+    if (s < MYOS_USER_BASE || s + len > MYOS_USER_LIMIT || s + len < s) {
+        return -1;
+    }
+    for (uint64_t i = 0; i < len; i++) {
+        dst[i] = src[i];
+    }
+    return 0;
+}
+
+static int copy_to_user_safe(char *dst, const char *src, uint64_t len) {
+    uint64_t d = (uint64_t)(uintptr_t)dst;
+    if (d < MYOS_USER_BASE || d + len > MYOS_USER_LIMIT || d + len < d) {
         return -1;
     }
     for (uint64_t i = 0; i < len; i++) {
@@ -47,7 +58,7 @@ static int copy_user_string(char *dst, const char *src, uint64_t max) {
     }
 
     uint64_t s = (uint64_t)(uintptr_t)src;
-    if (s < MYOS_USER_BASE || s + max > MYOS_USER_STACK_TOP || s + max < s) {
+    if (s < MYOS_USER_BASE || s + max > MYOS_USER_LIMIT || s + max < s) {
         return -1;
     }
 
@@ -166,7 +177,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
             if (uthread_ptr_valid(u)) {
                 syscall_stash_user_callee(u, user_rbx, user_rbp, user_r12, user_r13,
                                           user_r14, user_r15);
-                if (user_rip >= MYOS_USER_BASE && user_rip < MYOS_USER_STACK_TOP) {
+                if (user_rip >= MYOS_USER_BASE && user_rip < MYOS_USER_LIMIT) {
                     u->user_rip = user_rip;
                 }
                 if (user_rsp >= MYOS_USER_STACK_BASE && user_rsp < MYOS_USER_STACK_TOP) {
@@ -233,7 +244,10 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
             }
             if (a1) {
                 struct msg *out = (struct msg *)(uintptr_t)a1;
-                *out = m;
+                if (copy_to_user_safe((char *)out, (const char *)&m, sizeof(m)) != 0) {
+                    ret = (uint64_t)-1;
+                    break;
+                }
             }
             ret = 0;
             break;
@@ -409,7 +423,10 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
             }
             if (a2) {
                 struct msg *out = (struct msg *)(uintptr_t)a2;
-                *out = m;
+                if (copy_to_user_safe((char *)out, (const char *)&m, sizeof(m)) != 0) {
+                    ret = (uint64_t)-1;
+                    break;
+                }
             }
             ret = 0;
             break;
