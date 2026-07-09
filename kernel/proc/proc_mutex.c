@@ -32,6 +32,7 @@ int proc_mutex_lock_slot(struct proc_mutex *mutexes, int count, uint32_t id) {
     if (tok->holder == self && mutexes[id].uthread_holder != NULL &&
         mutexes[id].uthread_holder != u) {
         if (user_can_retry) {
+            u->user_syscall_ret = MYOS_ERR_AGAIN;
             uthread_yield();
             return MYOS_ERR_AGAIN;
         }
@@ -46,6 +47,7 @@ int proc_mutex_lock_slot(struct proc_mutex *mutexes, int count, uint32_t id) {
     }
 
     if (user_can_retry) {
+        u->user_syscall_ret = MYOS_ERR_AGAIN;
         uthread_yield();
         return MYOS_ERR_AGAIN;
     }

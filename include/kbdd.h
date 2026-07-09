@@ -9,6 +9,9 @@ uint32_t kbdd_thread_id(void);
 /* Called from IRQ after a scancode is queued. */
 void kbdd_irq_notify(void);
 
+/* Poll IRQ/serial rings once; return byte or -1 if none ready. */
+int kbdd_poll_char(void);
+
 /* Request one character via msgport IPC (MSG_KBD_WAIT → MSG_KBD_CHAR). */
 int kbdd_request_char(void);
 

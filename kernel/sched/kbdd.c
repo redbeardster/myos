@@ -8,7 +8,7 @@
 
 #include <stdint.h>
 
-#define KBDD_CHAR_RING  64
+#define KBDD_CHAR_RING  512
 #define KBDD_MAX_WAITERS 8
 
 static struct lwkt_thread *kbdd_thread;
@@ -213,31 +213,27 @@ uint32_t kbdd_thread_id(void) {
     return kbdd_lwkt_id;
 }
 
+int kbdd_poll_char(void) {
+    kbdd_drain_input();
+
+    char c = 0;
+    token_lock(&kbdd.lock);
+    int ok = char_ring_pop(&c);
+    token_unlock(&kbdd.lock);
+    if (!ok) {
+        return -1;
+    }
+    return (int)(unsigned char)c;
+}
+
 int kbdd_request_char(void) {
     struct lwkt_thread *self = lwkt_curthread();
     if (!self) {
         return -1;
     }
 
-    /*
-     * From int 0x80 the runner LWKT stays RUNNING across hlt; kbdd never
-     * gets scheduled to handle MSG_KBD_WAIT. Poll the IRQ scancode ring
-     * directly instead of blocking on msgport.
-     */
     if (lwkt_in_usersyscall()) {
-        for (;;) {
-            kbdd_drain_input();
-
-            char c = 0;
-            token_lock(&kbdd.lock);
-            int ok = char_ring_pop(&c);
-            token_unlock(&kbdd.lock);
-            if (ok) {
-                return (int)(unsigned char)c;
-            }
-
-            lwkt_syscall_wait_edge();
-        }
+        return kbdd_poll_char();
     }
 
     if (msg_send_name("kbdd", MSG_TYPE_KBD_WAIT, NULL, 0) != 0) {

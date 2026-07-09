@@ -286,6 +286,9 @@ static void run_command(char *line) {
             write_str("\n");
             return;
         }
+        for (int i = 0; i < 8; i++) {
+            myos_yield();
+        }
         write_str("\nStarted process ");
         write_dec((unsigned long)pid);
         write_str(" (ksebench.elf");

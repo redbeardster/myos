@@ -31,12 +31,18 @@ static inline myos_ssize_t myos_write(int fd, const void *buf, unsigned long len
     return (myos_ssize_t)myos_syscall4(MYOS_SYS_WRITE, fd, (long)(uintptr_t)buf, (long)len, 0);
 }
 
-static inline long myos_read_char(void) {
-    return myos_syscall4(MYOS_SYS_READ, 0, 0, 0, 0);
-}
-
 static inline long myos_yield(void) {
     return myos_syscall4(MYOS_SYS_YIELD, 0, 0, 0, 0);
+}
+
+static inline long myos_read_char(void) {
+    for (;;) {
+        long ret = myos_syscall4(MYOS_SYS_READ, 0, 0, 0, 0);
+        if (ret != MYOS_ERR_AGAIN) {
+            return ret;
+        }
+        myos_yield();
+    }
 }
 
 static inline long myos_exec(const char *path) {

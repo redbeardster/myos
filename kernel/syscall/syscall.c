@@ -135,6 +135,33 @@ static int sys_read(uint64_t fd) {
         return -1;
     }
 
+    if (lwkt_in_usersyscall()) {
+        int c = kbdd_poll_char();
+        if (c >= 0) {
+            lwkt_preempt_check();
+            return c;
+        }
+
+        struct proc *p = proc_current();
+        if (p && p->read_wake) {
+            p->read_wake = 0;
+            return MYOS_ERR_AGAIN;
+        }
+
+        struct uthread *u = uthread_current();
+        if (u) {
+            u->user_syscall_ret = MYOS_ERR_AGAIN;
+        }
+        lwkt_syscall_wait_edge();
+
+        c = kbdd_poll_char();
+        if (c >= 0) {
+            lwkt_preempt_check();
+            return c;
+        }
+        return MYOS_ERR_AGAIN;
+    }
+
     int c = kbdd_request_char();
     if (c < 0) {
         return -1;
@@ -233,10 +260,16 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
             ret = (uint64_t)(int64_t)sys_exec((const char *)(uintptr_t)a1, a2, a3);
             break;
 
-        case SYS_YIELD:
+        case SYS_YIELD: {
+            struct uthread *su = uthread_current();
+            struct lwkt_thread *self = lwkt_curthread();
+            if (su && self && su->lwkt == self && lwkt_in_usersyscall()) {
+                su->user_syscall_ret = 0;
+            }
             uthread_yield();
             ret = 0;
             break;
+        }
 
         case SYS_MSG_SEND: {
             char tmp[MSG_MAX_PAYLOAD];

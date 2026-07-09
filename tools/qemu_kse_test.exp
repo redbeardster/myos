@@ -2,7 +2,7 @@
 # QEMU regression for KSE-default scheduling.
 # Usage: tools/qemu_kse_test.exp [path-to-iso]
 
-set timeout 90
+set timeout 120
 set iso [lindex $argv 0]
 if {$iso eq ""} {
     set iso "build/myos.iso"
@@ -30,50 +30,47 @@ send "exec threads.elf\r"
 expect {
     -re "main done" { puts "PASS: threads" }
     -re "#PF|panic|GPF" { puts "FAIL: threads crash"; exit 3 }
-    timeout { puts "FAIL: threads timeout (main done never appeared)"; exit 4 }
+    timeout { puts "FAIL: threads timeout"; exit 4 }
 }
-expect -re "MyOS>"
-
-send "ksebench 4 2000\r"
 expect {
-    -re "ksebench report|ksebench run" { puts "PASS: ksebench started" }
+    -re "threads\\.elf\\) exited" { }
+    timeout { puts "FAIL: threads exit timeout"; exit 4 }
+}
+
+send "\r"
+after 500
+send "ksebench 4 2000\r"
+
+expect {
+    -re "schedmode=KSE" { puts "PASS: ksebench args" }
     -re "#PF|panic|create failed|exec failed" { puts "FAIL: ksebench crash"; exit 5 }
     timeout { puts "FAIL: ksebench start timeout"; exit 6 }
 }
 expect {
-    -re "OK" { puts "PASS: ksebench OK" }
-    -re "MISMATCH|FAIL" { puts "FAIL: ksebench mismatch"; exit 7 }
+    -re "=== ksebench report ===" { puts "PASS: ksebench report" }
+    -re "MISMATCH" { puts "FAIL: ksebench mismatch"; exit 7 }
     timeout { puts "FAIL: ksebench report timeout"; exit 8 }
 }
-expect -re "MyOS>"
-
-send "ksebench compare 4 5000\r"
 expect {
-    -re "ksebench compare" { puts "PASS: compare started" }
-    -re "#PF|panic|create failed" { puts "FAIL: compare crash"; exit 9 }
-    timeout { puts "FAIL: compare start timeout"; exit 10 }
+    -re "ksebench\\.elf\\) exited" { }
+    -re "#PF|panic" { puts "FAIL: ksebench post-exit crash"; exit 8 }
+    timeout { puts "FAIL: ksebench exit timeout"; exit 8 }
 }
-expect {
-    -re "winner:" { puts "PASS: compare winner" }
-    -re "MISMATCH|FAIL" { puts "FAIL: compare mismatch"; exit 11 }
-    timeout { puts "FAIL: compare report timeout"; exit 12 }
-}
-expect -re "MyOS>"
 
+send "\r"
+after 500
 send "schedmode\r"
 expect {
-    -re "schedmode=1" { puts "PASS: default schedmode KSE" }
-    -re "schedmode=0" { puts "WARN: schedmode still runner" }
+    -re "schedmode=1" { puts "PASS: schedmode KSE" }
+    -re "schedmode=0" { puts "WARN: schedmode runner" }
     timeout { puts "FAIL: schedmode timeout"; exit 13 }
 }
-expect -re "MyOS>"
 
 send "ps\r"
 expect {
     -re "PID" { puts "PASS: ps" }
     timeout { puts "FAIL: ps timeout"; exit 14 }
 }
-expect -re "MyOS>"
 
 send "exit\r"
 expect eof

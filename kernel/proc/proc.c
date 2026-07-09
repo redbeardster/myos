@@ -275,6 +275,32 @@ void proc_detach_uthread(struct proc *p, struct uthread *u) {
     spin_unlock_irqrestore(&proc_table_lock, irqf);
 }
 
+static void proc_wake_shell(void) {
+    uint64_t irqf;
+    struct proc *shell_proc = NULL;
+    struct lwkt_thread *shell_lwkt = NULL;
+
+    spin_lock_irqsave(&proc_table_lock, &irqf);
+    for (int i = 0; i < MAX_PROCS; i++) {
+        struct proc *s = &proc_table[i];
+        if (s->pid != 0 && s->is_shell && s->main_thread && s->main_thread->lwkt) {
+            shell_proc = s;
+            shell_lwkt = s->main_thread->lwkt;
+            break;
+        }
+    }
+    spin_unlock_irqrestore(&proc_table_lock, irqf);
+
+    if (shell_proc) {
+        shell_proc->read_wake = 1;
+    }
+    if (shell_lwkt) {
+        lwkt_nudge(shell_lwkt);
+        console_writestring("\nMyOS> ");
+        lwkt_sched_ipi_others();
+    }
+}
+
 void proc_on_uthread_exit(struct proc *p, struct uthread *u) {
     if (!p || p->pid == 0) {
         return;
@@ -296,6 +322,7 @@ void proc_on_uthread_exit(struct proc *p, struct uthread *u) {
         console_writestring(" (");
         console_writestring(p->name);
         console_writestring(") exited\n");
+        proc_wake_shell();
     }
 
     proc_destroy(p);

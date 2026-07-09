@@ -826,7 +826,6 @@ void uthread_yield(void) {
             return;
         }
         if (lwkt_in_usersyscall()) {
-            su->user_syscall_ret = (uint64_t)MYOS_ERR_AGAIN;
             self->runner_reswitch = 1;
             return;
         }

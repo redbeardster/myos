@@ -36,6 +36,7 @@ struct proc {
     uint64_t heap_next;
     uint64_t stack_next;
     int is_shell;
+    int read_wake;
     uint32_t sched_mode;
     int uthread_count;
     struct uthread *threads;
