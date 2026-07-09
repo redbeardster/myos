@@ -12,6 +12,8 @@
 #include "user.h"
 #include "uthread.h"
 
+static uint64_t ping_non_pong_skips;
+
 static void syscall_stash_user_callee(struct uthread *u, uint64_t rbx, uint64_t rbp,
                                      uint64_t r12, uint64_t r13, uint64_t r14,
                                      uint64_t r15) {
@@ -138,6 +140,12 @@ static int syscall_wait_pong(struct msg *out) {
         if (out->type == MSG_TYPE_PONG) {
             return 0;
         }
+        ping_non_pong_skips++;
+        if ((ping_non_pong_skips & 0x3F) == 0) {
+            console_writestring("\n[ping] skipped non-PONG messages=");
+            console_write_dec(ping_non_pong_skips);
+            console_writestring("\nMyOS> ");
+        }
         if (lwkt_in_usersyscall()) {
             lwkt_syscall_resched(MYOS_ERR_AGAIN);
             return MYOS_ERR_AGAIN;
@@ -237,6 +245,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
 
         case SYS_MSG_PING: {
             static const char ping[] = "ping";
+            int silent = (a1 & MYOS_MSG_PING_SILENT) != 0;
             if (a1 & MYOS_MSG_PING_SEND) {
                 if (msg_send_name("msgd", MSG_TYPE_PING, ping, 4) != 0) {
                     ret = (uint64_t)-2;
@@ -249,16 +258,18 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 ret = (uint64_t)(int64_t)rc;
                 break;
             }
-            console_writestring("\n[pong from msgd] \"");
-            for (uint32_t i = 0; i < m.size; i++) {
-                char c = (char)m.data[i];
-                if (c >= ' ' && c <= '~') {
-                    console_putchar(c);
-                } else {
-                    console_putchar('.');
+            if (!silent) {
+                console_writestring("\n[pong from msgd] \"");
+                for (uint32_t i = 0; i < m.size; i++) {
+                    char c = (char)m.data[i];
+                    if (c >= ' ' && c <= '~') {
+                        console_putchar(c);
+                    } else {
+                        console_putchar('.');
+                    }
                 }
+                console_writestring("\"\nMyOS> ");
             }
-            console_writestring("\"\nMyOS> ");
             ret = 0;
             break;
         }
@@ -362,6 +373,10 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
             ret = 0;
             break;
 
+        case SYS_IPC_BUMP_MODE:
+            ret = (uint64_t)(int64_t)lwkt_ipc_bump_mode((int)a1);
+            break;
+
         default:
             ret = (uint64_t)-1;
             break;
@@ -385,10 +400,6 @@ uint64_t syscall_post_dispatch(uint64_t ret) {
             runner_longjmp(&cur->runner_jmp, 1);
         }
         cur->in_syscall = 0;
-        if (cur->pending_ipc_resched && (int64_t)ret == MYOS_ERR_AGAIN) {
-            cur->pending_ipc_resched = 0;
-            lwkt_yield();
-        }
     }
     return ret;
 }

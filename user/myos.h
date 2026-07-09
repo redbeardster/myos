@@ -77,17 +77,25 @@ static inline long myos_msg_ports(void) {
     return myos_syscall4(MYOS_SYS_MSG_PORTS, 0, 0, 0, 0);
 }
 
-static inline long myos_msg_ping(void) {
-    long rc = myos_syscall4(MYOS_SYS_MSG_PING, MYOS_MSG_PING_SEND, 0, 0, 0);
+static inline long myos_ipc_bump_mode(long mode) {
+    return myos_syscall4(MYOS_SYS_IPC_BUMP_MODE, mode, 0, 0, 0);
+}
+
+static inline long myos_msg_ping_flags(long flags) {
+    long rc = myos_syscall4(MYOS_SYS_MSG_PING, MYOS_MSG_PING_SEND | flags, 0, 0, 0);
     if (rc < 0 && rc != MYOS_ERR_AGAIN) {
         return rc;
     }
     for (;;) {
-        rc = myos_syscall4(MYOS_SYS_MSG_PING, 0, 0, 0, 0);
+        rc = myos_syscall4(MYOS_SYS_MSG_PING, flags, 0, 0, 0);
         if (rc != MYOS_ERR_AGAIN) {
             return rc;
         }
     }
+}
+
+static inline long myos_msg_ping(void) {
+    return myos_msg_ping_flags(0);
 }
 
 static inline long myos_thread_create(uintptr_t entry, uint64_t arg, long prio) {

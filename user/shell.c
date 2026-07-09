@@ -34,8 +34,44 @@ static unsigned long str_len(const char *s) {
     return n;
 }
 
+static long parse_u32(const char *s, unsigned long *out) {
+    unsigned long v = 0;
+    if (!s || *s == '\0') {
+        return -1;
+    }
+    while (*s) {
+        if (*s < '0' || *s > '9') {
+            return -1;
+        }
+        v = v * 10 + (unsigned long)(*s - '0');
+        s++;
+    }
+    *out = v;
+    return 0;
+}
+
 static void write_str(const char *s) {
     myos_write(1, s, str_len(s));
+}
+
+static void write_dec(unsigned long v) {
+    char num[24];
+    int n = 0;
+    if (v == 0) {
+        num[n++] = '0';
+    } else {
+        char tmp[24];
+        int t = 0;
+        while (v > 0) {
+            tmp[t++] = (char)('0' + (v % 10));
+            v /= 10;
+        }
+        while (t > 0) {
+            num[n++] = tmp[--t];
+        }
+    }
+    num[n] = '\0';
+    write_str(num);
 }
 
 static void write_prompt(void) {
@@ -87,6 +123,9 @@ static void cmd_help(void) {
     write_str("  ports           - list named msgports\n");
     write_str("  msg [port] text - send to msgport (default msgd)\n");
     write_str("  ping            - msgport ping/pong with msgd\n");
+    write_str("  ipcmode [on/off]- toggle IPC receiver bump\n");
+    write_str("  pingbench [N]   - run N ping calls\n");
+    write_str("  pingbench_ab [N]- compare ping with bump off/on\n");
     write_str("  yield           - syscall yield test\n");
 }
 
@@ -140,6 +179,101 @@ static void run_command(char *line) {
         if (rc < 0) {
             write_str("\nping failed\n");
         }
+        return;
+    }
+
+    if (str_eq(line, "ipcmode")) {
+        long m = myos_ipc_bump_mode(-1);
+        write_str("\nipc bump mode: ");
+        write_str(m == 1 ? "on\n" : "off\n");
+        return;
+    }
+
+    if (str_starts(line, "ipcmode ")) {
+        const char *arg = line + 8;
+        skip_spaces(&arg);
+        long set = -1;
+        if (str_eq(arg, "on")) {
+            set = 1;
+        } else if (str_eq(arg, "off")) {
+            set = 0;
+        }
+        if (set < 0) {
+            write_str("\nusage: ipcmode [on|off]\n");
+            return;
+        }
+        long m = myos_ipc_bump_mode(set);
+        write_str("\nipc bump mode: ");
+        write_str(m == 1 ? "on\n" : "off\n");
+        return;
+    }
+
+    if (str_eq(line, "pingbench") || str_starts(line, "pingbench ")) {
+        unsigned long n = 50;
+        if (str_starts(line, "pingbench ")) {
+            const char *arg = line + 10;
+            skip_spaces(&arg);
+            if (parse_u32(arg, &n) != 0 || n == 0) {
+                write_str("\nusage: pingbench [N]\n");
+                return;
+            }
+        }
+        unsigned long ok = 0;
+        for (unsigned long i = 0; i < n; i++) {
+            if (myos_msg_ping_flags(MYOS_MSG_PING_SILENT) == 0) {
+                ok++;
+            }
+        }
+        write_str("\npingbench: ok=");
+        write_dec(ok);
+        write_str(" total=");
+        write_dec(n);
+        write_str("\n");
+        return;
+    }
+
+    if (str_eq(line, "pingbench_ab") || str_starts(line, "pingbench_ab ")) {
+        unsigned long n = 50;
+        if (str_starts(line, "pingbench_ab ")) {
+            const char *arg = line + 13;
+            skip_spaces(&arg);
+            if (parse_u32(arg, &n) != 0 || n == 0) {
+                write_str("\nusage: pingbench_ab [N]\n");
+                return;
+            }
+        }
+
+        long orig = myos_ipc_bump_mode(-1);
+        unsigned long ok_off = 0;
+        unsigned long ok_on = 0;
+
+        myos_ipc_bump_mode(0);
+        for (unsigned long i = 0; i < n; i++) {
+            if (myos_msg_ping_flags(MYOS_MSG_PING_SILENT) == 0) {
+                ok_off++;
+            }
+        }
+
+        myos_ipc_bump_mode(1);
+        for (unsigned long i = 0; i < n; i++) {
+            if (myos_msg_ping_flags(MYOS_MSG_PING_SILENT) == 0) {
+                ok_on++;
+            }
+        }
+
+        if (orig == 0 || orig == 1) {
+            myos_ipc_bump_mode(orig);
+        }
+
+        write_str("\npingbench_ab off=");
+        write_dec(ok_off);
+        write_str("/");
+        write_dec(n);
+        write_str(" on=");
+        write_dec(ok_on);
+        write_str("/");
+        write_dec(n);
+        write_str("\n");
         return;
     }
 

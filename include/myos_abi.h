@@ -40,6 +40,7 @@
 #define MYOS_SYS_MSG_SEND_NAME 19
 #define MYOS_SYS_PORT_LOOKUP   20
 #define MYOS_SYS_MSG_PORTS     21
+#define MYOS_SYS_IPC_BUMP_MODE 22
 
 #define MYOS_PROC_MUTEX_MAX    8
 
@@ -53,5 +54,6 @@
 #define MYOS_ERR_NOENT    (-2)
 
 #define MYOS_MSG_PING_SEND  1
+#define MYOS_MSG_PING_SILENT 2
 
 #endif

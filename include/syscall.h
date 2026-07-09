@@ -26,6 +26,7 @@
 #define SYS_MSG_SEND_NAME MYOS_SYS_MSG_SEND_NAME
 #define SYS_PORT_LOOKUP   MYOS_SYS_PORT_LOOKUP
 #define SYS_MSG_PORTS     MYOS_SYS_MSG_PORTS
+#define SYS_IPC_BUMP_MODE MYOS_SYS_IPC_BUMP_MODE
 
 void syscall_init(void);
 uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,

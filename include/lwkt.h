@@ -18,6 +18,7 @@ struct proc;
 
 /* LAPIC timer ~100 Hz: force a switch after this many ticks. */
 #define LWKT_QUANTUM_TICKS 3
+#define LWKT_IPC_BUMP_DEBOUNCE_TICKS 2
 
 enum thread_state {
     THREAD_READY = 0,
@@ -52,16 +53,18 @@ struct lwkt_thread {
     uint64_t user_cr3;
     uint64_t pending_cr3_destroy;
     uint64_t yields;
+    uint64_t quantum_expired;
+    uint64_t quantum_forced_switches;
     uint64_t saved_kernel_rsp;
     uint64_t runner_resume_rsp;
     runner_jmp_buf runner_jmp;
     uint8_t in_syscall;
     uint8_t runner_reswitch;
     uint8_t pending_kill;
-    uint8_t pending_ipc_resched;
     uint8_t quantum_left;
     uint8_t quantum_force;
     uint8_t mbox_slot;
+    uint32_t last_ipc_bump_tick;
     struct lwkt_thread *wait_next;      /* token / proc_mutex wait queues */
     struct lwkt_thread *mbox_wait_next; /* msgport read_waiters only */
     uint8_t stack[STACK_SIZE];
@@ -92,6 +95,7 @@ void lwkt_preempt_request(void);
 void lwkt_preempt_check(void);
 void lwkt_timer_tick(void);
 void lwkt_ipc_bump(struct lwkt_thread *t);
+int lwkt_ipc_bump_mode(int mode);
 void lwkt_thread_exit(void);
 
 void lwkt_cpu_init_idle(void);

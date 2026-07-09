@@ -22,6 +22,11 @@ static spinlock_t sched_lock;
 static int thread_count;
 static uint32_t next_id = 1;
 static int sched_active;
+static int ipc_bump_enabled = 1;
+static uint64_t ipc_bump_attempts;
+static uint64_t ipc_bump_applied;
+static uint64_t ipc_bump_skipped_debounce;
+static uint64_t ipc_bump_skipped_disabled;
 
 static struct cpu *this_cpu(void);
 static void strcpy_local(char *dst, const char *src);
@@ -339,6 +344,10 @@ static void print_thread_row(struct lwkt_thread *t, int is_current) {
     } else {
         console_writestring("-");
     }
+    console_writestring("  ");
+    console_write_dec(t->quantum_expired);
+    console_writestring("/");
+    console_write_dec(t->quantum_forced_switches);
     console_putchar('\n');
 }
 
@@ -393,12 +402,14 @@ void lwkt_cpu_init_idle(void) {
     idle->next = NULL;
     idle->run_cpu = cpu->id;
     idle->yields = 0;
+    idle->quantum_expired = 0;
+    idle->quantum_forced_switches = 0;
     idle->saved_kernel_rsp = 0;
     idle->mbox_slot = 0;
     idle->pending_kill = 0;
-    idle->pending_ipc_resched = 0;
     idle->quantum_left = LWKT_QUANTUM_TICKS;
     idle->quantum_force = 0;
+    idle->last_ipc_bump_tick = 0;
     idle->wait_next = NULL;
     idle->mbox_wait_next = NULL;
     idle->uthread = NULL;
@@ -462,9 +473,22 @@ static void sched_unlock_irqrestore(uint64_t irqf) {
 }
 
 void lwkt_ipc_bump(struct lwkt_thread *t) {
+    ipc_bump_attempts++;
     if (!t || t->state != THREAD_READY) {
         return;
     }
+    if (!ipc_bump_enabled) {
+        ipc_bump_skipped_disabled++;
+        return;
+    }
+
+    uint32_t now = (uint32_t)timer_get_ticks();
+    if (t->last_ipc_bump_tick != 0 &&
+        (uint32_t)(now - t->last_ipc_bump_tick) < LWKT_IPC_BUMP_DEBOUNCE_TICKS) {
+        ipc_bump_skipped_debounce++;
+        return;
+    }
+    t->last_ipc_bump_tick = now;
 
     uint64_t irqf;
     sched_lock_irqsave(&irqf);
@@ -473,7 +497,15 @@ void lwkt_ipc_bump(struct lwkt_thread *t) {
         enqueue_on_cpu_head(pick_enqueue_cpu(), t);
     }
     sched_unlock_irqrestore(irqf);
+    ipc_bump_applied++;
     lwkt_sched_ipi_others();
+}
+
+int lwkt_ipc_bump_mode(int mode) {
+    if (mode == 0 || mode == 1) {
+        ipc_bump_enabled = mode;
+    }
+    return ipc_bump_enabled;
 }
 
 struct lwkt_thread *lwkt_create(const char *name, void (*entry)(void *), void *arg, uint32_t priority) {
@@ -523,15 +555,17 @@ struct lwkt_thread *lwkt_create(const char *name, void (*entry)(void *), void *a
     t->user_cr3 = 0;
     t->pending_cr3_destroy = 0;
     t->yields = 0;
+    t->quantum_expired = 0;
+    t->quantum_forced_switches = 0;
     t->saved_kernel_rsp = 0;
     t->runner_resume_rsp = 0;
     t->runner_jmp.rsp = 0;
     t->in_syscall = 0;
     t->runner_reswitch = 0;
     t->pending_kill = 0;
-    t->pending_ipc_resched = 0;
     t->quantum_left = LWKT_QUANTUM_TICKS;
     t->quantum_force = 0;
+    t->last_ipc_bump_tick = 0;
     t->wait_next = NULL;
     t->mbox_wait_next = NULL;
     t->mbox_slot = (uint8_t)((t - thread_pool) + 1);
@@ -681,8 +715,8 @@ void lwkt_list(void) {
     int total;
     uint64_t irqf;
 
-    console_writestring("\nLWKT  Slot Proc  Name            Prio  State      CPU CR3\n");
-    console_writestring("----  ---- ----  --------------  ----  ---------  --- ---------------\n");
+    console_writestring("\nLWKT  Slot Proc  Name            Prio  State      CPU CR3            Qexp/Qsw\n");
+    console_writestring("----  ---- ----  --------------  ----  ---------  --- --------------- --------\n");
 
     snap_n = lwkt_list_collect(snap, LWKT_LIST_SNAP_MAX, current);
 
@@ -701,6 +735,15 @@ void lwkt_list(void) {
     console_writestring("\nTotal: ");
     console_write_dec((uint64_t)total + cpu_online_count());
     console_writestring(" threads (incl. idle per CPU)\n");
+    console_writestring("IPC bump mode=");
+    console_write_dec((uint64_t)ipc_bump_enabled);
+    console_writestring(" applied=");
+    console_write_dec(ipc_bump_applied);
+    console_writestring(" debounce_skip=");
+    console_write_dec(ipc_bump_skipped_debounce);
+    console_writestring(" disabled_skip=");
+    console_write_dec(ipc_bump_skipped_disabled);
+    console_putchar('\n');
 }
 
 struct lwkt_thread *lwkt_curthread(void) {
@@ -734,7 +777,6 @@ int lwkt_syscall_resched(int64_t retry_ret) {
     if (u) {
         u->user_syscall_ret = (uint64_t)retry_ret;
     }
-    cur->pending_ipc_resched = 1;
     lwkt_syscall_wait_edge();
     return 1;
 }
@@ -817,6 +859,7 @@ void lwkt_timer_tick(void) {
         cur->quantum_left--;
     }
     if (cur->quantum_left == 0) {
+        cur->quantum_expired++;
         cur->quantum_left = LWKT_QUANTUM_TICKS;
         cur->quantum_force = 1;
         lwkt_preempt_request();
@@ -886,6 +929,9 @@ void lwkt_preempt_check(void) {
         return;
     }
 
+    if (cur->quantum_force) {
+        cur->quantum_forced_switches++;
+    }
     cpu->preempt_requested = 0;
     lwkt_switch();
 }
