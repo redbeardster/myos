@@ -150,7 +150,7 @@ int lwkt_syscall_resched(int64_t retry_ret);
 - `uthread_join` и `proc_mutex_lock` для `MYOS_ERR_AGAIN`;
 - `SYS_MSG_RECV`: в syscall runner делается `msg_receive(..., 0)` + retry через `MYOS_ERR_AGAIN`, без block-loop в `msg_receive(..., 1)`.
 - `SYS_MSG_PING`: send выполняется один раз (`MYOS_MSG_PING_SEND`), далее только wait на `PONG` через retry.
-- После `MYOS_ERR_AGAIN` в IPC-path: `pending_ipc_resched` + `lwkt_yield()` в `syscall_post_dispatch` для передачи CPU сервисным LWKT (`msgd`, `kbdd`).
+- После `MYOS_ERR_AGAIN` в IPC-path **не** делаем `lwkt_yield()` в `syscall_post_dispatch` (это нарушает инвариант syscall stack); перенос работы делается через `lwkt_syscall_wait_edge()` + timer preempt + IPC bump.
 
 ### 4.3. Клавиатура (`SYS_READ`)
 
