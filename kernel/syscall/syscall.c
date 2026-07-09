@@ -122,6 +122,29 @@ static int syscall_msg_receive(struct msg *out, int block) {
     return rc;
 }
 
+static int syscall_wait_pong(struct msg *out) {
+    for (;;) {
+        int rc = msg_receive(out, 0);
+        if (rc == 1) {
+            if (lwkt_in_usersyscall()) {
+                lwkt_syscall_resched(MYOS_ERR_AGAIN);
+                return MYOS_ERR_AGAIN;
+            }
+            continue;
+        }
+        if (rc != 0) {
+            return rc;
+        }
+        if (out->type == MSG_TYPE_PONG) {
+            return 0;
+        }
+        if (lwkt_in_usersyscall()) {
+            lwkt_syscall_resched(MYOS_ERR_AGAIN);
+            return MYOS_ERR_AGAIN;
+        }
+    }
+}
+
 uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                           uint64_t user_rip, uint64_t user_rsp,
                           uint64_t user_rbx, uint64_t user_rbp,
@@ -214,18 +237,16 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
 
         case SYS_MSG_PING: {
             static const char ping[] = "ping";
-            if (msg_send_name("msgd", MSG_TYPE_PING, ping, 4) != 0) {
-                ret = (uint64_t)-2;
-                break;
+            if (a1 & MYOS_MSG_PING_SEND) {
+                if (msg_send_name("msgd", MSG_TYPE_PING, ping, 4) != 0) {
+                    ret = (uint64_t)-2;
+                    break;
+                }
             }
             struct msg m;
-            int rc = syscall_msg_receive(&m, 1);
+            int rc = syscall_wait_pong(&m);
             if (rc != 0) {
                 ret = (uint64_t)(int64_t)rc;
-                break;
-            }
-            if (m.type != MSG_TYPE_PONG) {
-                ret = (uint64_t)-3;
                 break;
             }
             console_writestring("\n[pong from msgd] \"");
@@ -364,6 +385,10 @@ uint64_t syscall_post_dispatch(uint64_t ret) {
             runner_longjmp(&cur->runner_jmp, 1);
         }
         cur->in_syscall = 0;
+        if (cur->pending_ipc_resched && (int64_t)ret == MYOS_ERR_AGAIN) {
+            cur->pending_ipc_resched = 0;
+            lwkt_yield();
+        }
     }
     return ret;
 }

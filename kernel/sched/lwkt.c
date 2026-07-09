@@ -51,6 +51,17 @@ static void enqueue_on_cpu(struct cpu *cpu, struct lwkt_thread *t) {
     *slot = t;
 }
 
+static void enqueue_on_cpu_head(struct cpu *cpu, struct lwkt_thread *t) {
+    if (!cpu || !t || t->state == THREAD_TERMINATED) {
+        return;
+    }
+
+    uint32_t p = t->priority;
+    t->run_cpu = cpu->id;
+    t->next = cpu->run_queues[p];
+    cpu->run_queues[p] = t;
+}
+
 static struct cpu *pick_enqueue_cpu(void);
 
 static void enqueue_thread(struct lwkt_thread *t) {
@@ -129,9 +140,21 @@ static struct lwkt_thread *dequeue_from_cpu(struct cpu *cpu, struct lwkt_thread 
 }
 
 static struct lwkt_thread *dequeue_thread(struct cpu *cpu, struct lwkt_thread *skip) {
-    struct lwkt_thread *t = dequeue_from_cpu(cpu, skip, 1);
+    int skip_fallback = 1;
+    if (skip && skip->quantum_force) {
+        skip_fallback = 0;
+    }
+
+    struct lwkt_thread *t = dequeue_from_cpu(cpu, skip, skip_fallback);
     if (t) {
+        if (skip && skip->quantum_force && t != skip) {
+            skip->quantum_force = 0;
+        }
         return t;
+    }
+
+    if (skip && skip->quantum_force) {
+        skip->quantum_force = 0;
     }
 
     /* Work steal: idle CPU pulls from another CPU's queue. */
@@ -148,37 +171,6 @@ static struct lwkt_thread *dequeue_thread(struct cpu *cpu, struct lwkt_thread *s
     }
 
     return &cpu->idle;
-}
-
-static int cpu_has_runnable(struct cpu *cpu) {
-    if (!cpu) {
-        return 0;
-    }
-    for (uint32_t p = 0; p < MAX_PRIORITY; p++) {
-        for (struct lwkt_thread *t = cpu->run_queues[p]; t; t = t->next) {
-            if (t->state == THREAD_READY) {
-                return 1;
-            }
-        }
-    }
-    return 0;
-}
-
-static int cpu_has_ready_excluding_idle(struct cpu *cpu) {
-    if (!cpu) {
-        return 0;
-    }
-    for (uint32_t p = 0; p < MAX_PRIORITY; p++) {
-        for (struct lwkt_thread *t = cpu->run_queues[p]; t; t = t->next) {
-            if (t == &cpu->idle) {
-                continue;
-            }
-            if (t->state == THREAD_READY || t->state == THREAD_RUNNING) {
-                return 1;
-            }
-        }
-    }
-    return 0;
 }
 
 static int cpu_has_ready_peer(struct cpu *cpu) {
@@ -404,6 +396,9 @@ void lwkt_cpu_init_idle(void) {
     idle->saved_kernel_rsp = 0;
     idle->mbox_slot = 0;
     idle->pending_kill = 0;
+    idle->pending_ipc_resched = 0;
+    idle->quantum_left = LWKT_QUANTUM_TICKS;
+    idle->quantum_force = 0;
     idle->wait_next = NULL;
     idle->mbox_wait_next = NULL;
     idle->uthread = NULL;
@@ -466,6 +461,21 @@ static void sched_unlock_irqrestore(uint64_t irqf) {
     spin_unlock_irqrestore(&sched_lock, irqf);
 }
 
+void lwkt_ipc_bump(struct lwkt_thread *t) {
+    if (!t || t->state != THREAD_READY) {
+        return;
+    }
+
+    uint64_t irqf;
+    sched_lock_irqsave(&irqf);
+    if (t->state == THREAD_READY) {
+        remove_from_queues(t);
+        enqueue_on_cpu_head(pick_enqueue_cpu(), t);
+    }
+    sched_unlock_irqrestore(irqf);
+    lwkt_sched_ipi_others();
+}
+
 struct lwkt_thread *lwkt_create(const char *name, void (*entry)(void *), void *arg, uint32_t priority) {
     if (priority >= MAX_PRIORITY) {
         priority = MAX_PRIORITY - 1;
@@ -519,6 +529,9 @@ struct lwkt_thread *lwkt_create(const char *name, void (*entry)(void *), void *a
     t->in_syscall = 0;
     t->runner_reswitch = 0;
     t->pending_kill = 0;
+    t->pending_ipc_resched = 0;
+    t->quantum_left = LWKT_QUANTUM_TICKS;
+    t->quantum_force = 0;
     t->wait_next = NULL;
     t->mbox_wait_next = NULL;
     t->mbox_slot = (uint8_t)((t - thread_pool) + 1);
@@ -721,6 +734,7 @@ int lwkt_syscall_resched(int64_t retry_ret) {
     if (u) {
         u->user_syscall_ret = (uint64_t)retry_ret;
     }
+    cur->pending_ipc_resched = 1;
     lwkt_syscall_wait_edge();
     return 1;
 }
@@ -788,6 +802,27 @@ void lwkt_preempt_request(void) {
     }
 }
 
+void lwkt_timer_tick(void) {
+    struct cpu *cpu = this_cpu();
+    if (!cpu || !cpu->sched_active) {
+        return;
+    }
+
+    struct lwkt_thread *cur = cpu->current;
+    if (!cur || cur == &cpu->idle || cur->state != THREAD_RUNNING) {
+        return;
+    }
+
+    if (cur->quantum_left > 0) {
+        cur->quantum_left--;
+    }
+    if (cur->quantum_left == 0) {
+        cur->quantum_left = LWKT_QUANTUM_TICKS;
+        cur->quantum_force = 1;
+        lwkt_preempt_request();
+    }
+}
+
 void lwkt_preempt_check(void) {
     struct cpu *cpu = this_cpu();
     if (!cpu || !cpu->preempt_requested || !cpu->sched_active) {
@@ -842,6 +877,11 @@ void lwkt_preempt_check(void) {
     spin_unlock(&sched_lock);
 
     if (!other && cur == &cpu->idle) {
+        cpu->preempt_requested = 0;
+        return;
+    }
+
+    if (!other && !cur->quantum_force) {
         cpu->preempt_requested = 0;
         return;
     }

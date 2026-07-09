@@ -148,7 +148,9 @@ int lwkt_syscall_resched(int64_t retry_ret);
 Использование:
 
 - `uthread_join` и `proc_mutex_lock` для `MYOS_ERR_AGAIN`;
-- `SYS_MSG_RECV`/`SYS_MSG_PING`: в syscall runner делается `msg_receive(..., 0)` + retry через `MYOS_ERR_AGAIN`, без block-loop в `msg_receive(..., 1)`.
+- `SYS_MSG_RECV`: в syscall runner делается `msg_receive(..., 0)` + retry через `MYOS_ERR_AGAIN`, без block-loop в `msg_receive(..., 1)`.
+- `SYS_MSG_PING`: send выполняется один раз (`MYOS_MSG_PING_SEND`), далее только wait на `PONG` через retry.
+- После `MYOS_ERR_AGAIN` в IPC-path: `pending_ipc_resched` + `lwkt_yield()` в `syscall_post_dispatch` для передачи CPU сервисным LWKT (`msgd`, `kbdd`).
 
 ### 4.3. Клавиатура (`SYS_READ`)
 
@@ -217,6 +219,12 @@ for (;;) {
 
 In-proc pick: **меньше число = выше приоритет** (как LWKT).
 
+### 6.1. Жёсткое квантование LWKT
+
+- `LWKT_QUANTUM_TICKS` (по умолчанию 3 тика LAPIC/PIT, ~30 ms при 100 Hz).
+- По исчерпанию кванта поток получает `quantum_force`, и `dequeue_thread()` не выбирает его fallback-веткой.
+- Это ломает starvation, когда `p1` (prio 2) бесконечно вытесняет `msgd` (prio 8) на SMP.
+
 ---
 
 ## 7. Чеклист регрессии proc-runner
@@ -236,7 +244,7 @@ In-proc pick: **меньше число = выше приоритет** (как 
 
 - **Msgport из syscall**: для блокирующего recv обязателен retry-протокол (`MYOS_ERR_AGAIN`) в userland-обёртках; прямой single-shot `SYS_MSG_RECV(block=1)` в приложении без retry может зависнуть по ожиданиям API.
 - **Preempt runner в user mode** без сохранения uthread state — отключён в `lwkt_preempt_check`.
-- **Максимум:** `MAX_THREADS` LWKT, `MAX_PROCS` proc, `STACK_SIZE` 4 KiB на LWKT.
+- **Максимум:** `MAX_THREADS` LWKT, `MAX_PROCS` proc, `STACK_SIZE` 8 KiB на LWKT.
 
 ---
 

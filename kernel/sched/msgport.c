@@ -302,6 +302,8 @@ int msg_send(uint32_t to_id, uint32_t type, const void *data, uint32_t size) {
 
     if (wake) {
         lwkt_unblock(wake);
+    } else {
+        lwkt_ipc_bump(to);
     }
     return 0;
 }
@@ -508,7 +510,7 @@ int msgd_start(void) {
     if (!u || !u->lwkt) {
         return -1;
     }
-    msgd_lwkt_id = u->uthread_id;
+    msgd_lwkt_id = u->lwkt->id;
     if (msgport_register("msgd", u->lwkt) != 0) {
         console_writestring("msgport_register(msgd) failed\n");
     }

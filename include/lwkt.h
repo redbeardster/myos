@@ -16,6 +16,9 @@ struct proc;
 #define LWKT_PRIO_NORMAL   8
 #define LWKT_PRIO_LOW      15
 
+/* LAPIC timer ~100 Hz: force a switch after this many ticks. */
+#define LWKT_QUANTUM_TICKS 3
+
 enum thread_state {
     THREAD_READY = 0,
     THREAD_RUNNING = 1,
@@ -55,6 +58,9 @@ struct lwkt_thread {
     uint8_t in_syscall;
     uint8_t runner_reswitch;
     uint8_t pending_kill;
+    uint8_t pending_ipc_resched;
+    uint8_t quantum_left;
+    uint8_t quantum_force;
     uint8_t mbox_slot;
     struct lwkt_thread *wait_next;      /* token / proc_mutex wait queues */
     struct lwkt_thread *mbox_wait_next; /* msgport read_waiters only */
@@ -84,6 +90,8 @@ void lwkt_block(void);
 void lwkt_unblock(struct lwkt_thread *t);
 void lwkt_preempt_request(void);
 void lwkt_preempt_check(void);
+void lwkt_timer_tick(void);
+void lwkt_ipc_bump(struct lwkt_thread *t);
 void lwkt_thread_exit(void);
 
 void lwkt_cpu_init_idle(void);

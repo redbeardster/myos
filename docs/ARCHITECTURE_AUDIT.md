@@ -18,7 +18,7 @@
 | SMP LWKT scheduler | ⚠️ | work-steal есть; shell в READ держит BSP |
 | Прерывания | ✅ | vector/rip фикс; preempt guard при `in_syscall` |
 | Изоляция памяти (CR3) | ⚠️ | per-proc PT есть; safe copy user буферов — нет |
-| Zombie uthread cleanup | ⚠️ | слоты не переиспользуются сразу после join |
+| Zombie uthread cleanup | ✅ | reaper в `join` и при `proc` exit |
 
 **Вердикт:** архитектура **концептуально верна** для демо и отладки SMP.
 Для production-grade нужны пункты из раздела 9.
@@ -251,6 +251,7 @@ shell на CPU 0: READ + hlt (RUNNING, in_syscall=1)
 | C1 | GPF #13 в `syscall_stash_user_callee` | `lwkt_yield` из wait_edge портил RSP | wait_edge = только `sti;hlt` |
 | C2 | threads.elf долго в `ready` | p2 в очереди CPU 0, shell держит CPU | `pick_enqueue_cpu` + IPI после exec |
 | C3 | Hang после `cpus` | IPI storm + idle spin на msgd READY | только `user_proc` runners; без IPI в wait |
+| C5 | `ping` зависал (`msgd` READY) | starvation: shell prio 2 вытеснял msgd prio 8 | жёсткий квант + IPC bump + post-syscall yield |
 | C4 | Битый `current_uthread` | запись по невалидному указателю | `uthread_ptr_valid()` |
 
 ### Хронология симптомов
@@ -261,18 +262,19 @@ exec threads.elf → REBOOT           (B1–B7)
 threads OK → cpus → GPF             (C1)
 threads OK, долго в ready           (C2)
 threads OK, cpus OK → hang          (C3)
-Стабильно: threads + cpus + uthreads + prompt
+ping hang при msgd ready            (C5)
+Стабильно: threads + cpus + uthreads + ping + prompt
 ```
 
 ---
 
 ## 9. Технический долг (приоритет)
 
-1. **Zombie reaper** — переиспользование uthread slots после join.
-2. **`copy_from_user_safe`** — page fault handler для user pointers.
-3. **Exec ACL** — кто может запускать какие модули.
-4. **Console serialisation** — prompt не должен перемешиваться с child output.
-5. **Документация PROC_RUNNER** — синхронизировать с текущим wait_edge (без yield).
+1. **`copy_from_user_safe`** — page fault handler для user pointers.
+2. **Exec ACL** — кто может запускать какие модули.
+3. **Console serialisation** — prompt не должен перемешиваться с child output.
+4. **Метрики fairness** — экспорт per-LWKT квант/вытеснение для диагностики starvation.
+5. **Нагрузочные тесты IPC** — burst ping/msg под `SMP=8`.
 
 ---
 
@@ -291,8 +293,9 @@ make run    # SMP=8 в Makefile
 | 3 | `exec threads.elf` | workers, `join: … counter=10`, Process 2 exited |
 | 4 | `cpus` | 8 CPU, p1 running |
 | 5 | `uthreads` | shell running; zombies допустимы |
-| 6 | несколько команд подряд | нет hang / GPF |
-| 7 | htop на хосте | QEMU ~0–15% в idle |
+| 6 | `ping`, `msg msgd hello` | стабильно, без hang |
+| 7 | несколько команд подряд | нет hang / GPF |
+| 8 | htop на хосте | QEMU ~0–15% в idle |
 
 ### Инварианты — не ломать
 

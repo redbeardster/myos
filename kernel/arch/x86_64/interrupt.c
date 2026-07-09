@@ -200,6 +200,7 @@ void timer_set_enabled(int enabled) {
 void timer_interrupt_handler(void) {
     timer_ticks++;
     timer_switch_count++;
+    lwkt_timer_tick();
     lwkt_preempt_request();
 }
 
@@ -222,6 +223,7 @@ void interrupt_handler(uint64_t int_no, uint64_t err_code, uint64_t rip, uint64_
     if (int_no == LAPIC_TIMER_VECTOR) {
         timer_ticks++;
         timer_switch_count++;
+        lwkt_timer_tick();
         lwkt_preempt_request();
         lapic_eoi();
         if (!lwkt_in_usersyscall()) {

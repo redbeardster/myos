@@ -52,4 +52,6 @@
 #define MYOS_ERR_AGAIN    (-11)
 #define MYOS_ERR_NOENT    (-2)
 
+#define MYOS_MSG_PING_SEND  1
+
 #endif

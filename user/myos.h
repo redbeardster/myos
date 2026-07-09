@@ -78,10 +78,14 @@ static inline long myos_msg_ports(void) {
 }
 
 static inline long myos_msg_ping(void) {
+    long rc = myos_syscall4(MYOS_SYS_MSG_PING, MYOS_MSG_PING_SEND, 0, 0, 0);
+    if (rc < 0 && rc != MYOS_ERR_AGAIN) {
+        return rc;
+    }
     for (;;) {
-        long ret = myos_syscall4(MYOS_SYS_MSG_PING, 0, 0, 0, 0);
-        if (ret != MYOS_ERR_AGAIN) {
-            return ret;
+        rc = myos_syscall4(MYOS_SYS_MSG_PING, 0, 0, 0, 0);
+        if (rc != MYOS_ERR_AGAIN) {
+            return rc;
         }
     }
 }
