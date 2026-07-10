@@ -108,6 +108,7 @@ static inline long myos_msg_ping_flags(long flags) {
         if (rc != MYOS_ERR_AGAIN) {
             return rc;
         }
+        myos_yield();
     }
 }
 
@@ -130,6 +131,7 @@ static inline long myos_thread_join(long uthread_id) {
         if (ret != MYOS_ERR_AGAIN) {
             return ret;
         }
+        myos_yield();
     }
 }
 
@@ -139,6 +141,7 @@ static inline long myos_mutex_lock(unsigned long id) {
         if (ret != MYOS_ERR_AGAIN) {
             return ret;
         }
+        myos_yield();
     }
 }
 
