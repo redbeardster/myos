@@ -93,6 +93,9 @@ static void kbdd_drain_serial(void) {
         if (c == '\r') {
             c = '\n';
         }
+        if (c == 127) {
+            c = '\b';
+        }
         token_lock(&kbdd.lock);
         char_ring_push((char)c);
         token_unlock(&kbdd.lock);

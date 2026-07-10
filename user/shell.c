@@ -109,6 +109,10 @@ static void write_rc(long rc) {
     }
 }
 
+static int is_backspace(long c) {
+    return c == '\b' || c == 127;
+}
+
 static int read_line(char *buf, int max) {
     int i = 0;
     while (i < max - 1) {
@@ -117,7 +121,7 @@ static int read_line(char *buf, int max) {
             return -1;
         }
 
-        if (c == '\b') {
+        if (is_backspace(c)) {
             if (i > 0) {
                 i--;
                 write_str("\b \b");
