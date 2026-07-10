@@ -136,30 +136,25 @@ static int sys_read(uint64_t fd) {
     }
 
     if (lwkt_in_usersyscall()) {
-        int c = kbdd_poll_char();
-        if (c >= 0) {
-            lwkt_preempt_check();
-            return c;
-        }
+        for (;;) {
+            int c = kbdd_poll_char();
+            if (c >= 0) {
+                lwkt_preempt_check();
+                return c;
+            }
 
-        struct proc *p = proc_current();
-        if (p && p->read_wake) {
-            p->read_wake = 0;
-            return MYOS_ERR_AGAIN;
-        }
+            struct proc *p = proc_current();
+            if (p && p->read_wake) {
+                p->read_wake = 0;
+                return MYOS_ERR_AGAIN;
+            }
 
-        struct uthread *u = uthread_current();
-        if (u) {
-            u->user_syscall_ret = MYOS_ERR_AGAIN;
+            struct uthread *u = uthread_current();
+            if (u) {
+                u->user_syscall_ret = MYOS_ERR_AGAIN;
+            }
+            lwkt_syscall_wait_edge();
         }
-        lwkt_syscall_wait_edge();
-
-        c = kbdd_poll_char();
-        if (c >= 0) {
-            lwkt_preempt_check();
-            return c;
-        }
-        return MYOS_ERR_AGAIN;
     }
 
     int c = kbdd_request_char();

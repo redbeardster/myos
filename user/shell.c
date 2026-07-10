@@ -1027,6 +1027,9 @@ int main(void) {
         if (read_line(line, (int)sizeof(line)) < 0) {
             break;
         }
+        if (line[0] == '\0') {
+            continue;
+        }
         run_command(line);
     }
 

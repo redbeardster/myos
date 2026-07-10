@@ -95,6 +95,7 @@ static void proc_reset_slot(struct proc *p) {
     p->heap_next = 0;
     p->stack_next = 0;
     p->is_shell = 0;
+    p->read_wake = 0;
     p->sched_mode = PROC_SCHED_KSE;
     p->uthread_count = 0;
     p->threads = NULL;

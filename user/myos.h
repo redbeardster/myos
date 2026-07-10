@@ -41,7 +41,6 @@ static inline long myos_read_char(void) {
         if (ret != MYOS_ERR_AGAIN) {
             return ret;
         }
-        myos_yield();
     }
 }
 
