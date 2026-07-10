@@ -63,6 +63,7 @@ void uthread_yield(void);
 void uthread_list(void);
 
 void uthread_reap_proc(struct proc *p);
+void uthread_discard_zombie(struct uthread *u);
 
 uint32_t uthread_slot_of(const struct uthread *u);
 int uthread_index_in_proc(const struct uthread *u);

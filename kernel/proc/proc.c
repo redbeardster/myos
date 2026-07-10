@@ -313,6 +313,10 @@ void proc_on_uthread_exit(struct proc *p, struct uthread *u) {
 
     uthread_reap_proc(p);
 
+    if (u && u->state == UTHREAD_ZOMBIE) {
+        uthread_discard_zombie(u);
+    }
+
     if (p->uthread_count > 0) {
         return;
     }

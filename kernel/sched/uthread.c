@@ -556,6 +556,16 @@ void uthread_reap_proc(struct proc *p) {
     }
 }
 
+void uthread_discard_zombie(struct uthread *u) {
+    if (!u || u->state != UTHREAD_ZOMBIE) {
+        return;
+    }
+    uint64_t irqf;
+    spin_lock_irqsave(&uthread_join_lock, &irqf);
+    uthread_reset_slot(u);
+    spin_unlock_irqrestore(&uthread_join_lock, irqf);
+}
+
 int proc_start_runner(struct proc *p, uint32_t lwkt_priority) {
     if (!p || p->runner) {
         return p && p->runner ? 0 : -1;
@@ -900,7 +910,7 @@ void uthread_exit(void) {
 
     if (kse_user_exit || !p || !p->runner) {
         if (p && p->uthread_count == 0) {
-            proc_on_uthread_exit(p, NULL);
+            proc_on_uthread_exit(p, u);
         }
         lwkt_thread_exit();
     }
