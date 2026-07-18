@@ -144,15 +144,31 @@ static int sys_read(uint64_t fd) {
             }
 
             struct proc *p = proc_current();
+            struct uthread *u = uthread_current();
             if (p && p->read_wake) {
-                /* Wake hint only — stay in kernel and re-poll / hlt. */
                 p->read_wake = 0;
-                continue;
             }
 
-            struct uthread *u = uthread_current();
-            if (u) {
-                u->user_syscall_ret = MYOS_ERR_AGAIN;
+            /*
+             * Runner: never park in syscall — yield to sibling uthreads.
+             * UP KSE: return AGAIN so myos_read_char can yield (children need
+             * the only CPU). SMP KSE: park with wait_edge like before 7b —
+             * returning AGAIN+yield from the idle shell storms the scheduler
+             * and flakes ksebench.
+             */
+            if (p && p->sched_mode == PROC_SCHED_RUNNER) {
+                if (u) {
+                    u->user_syscall_ret = (uint64_t)MYOS_ERR_AGAIN;
+                }
+                uthread_yield();
+                return MYOS_ERR_AGAIN;
+            }
+            if (cpu_online_count() <= 1) {
+                if (u) {
+                    u->user_syscall_ret = (uint64_t)MYOS_ERR_AGAIN;
+                }
+                lwkt_syscall_wait_edge();
+                return MYOS_ERR_AGAIN;
             }
             lwkt_syscall_wait_edge();
         }
@@ -211,7 +227,7 @@ static int syscall_wait_pong(struct msg *out) {
         if ((ping_non_pong_skips & 0x3F) == 0) {
             console_writestring("\n[ping] skipped non-PONG messages=");
             console_write_dec(ping_non_pong_skips);
-            console_writestring("\nMyOS> ");
+            console_writestring("\n");
         }
         if (lwkt_in_usersyscall()) {
             lwkt_syscall_resched(MYOS_ERR_AGAIN);
@@ -332,7 +348,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                         console_putchar('.');
                     }
                 }
-                console_writestring("\"\nMyOS> ");
+                console_writestring("\"\n");
             }
             ret = 0;
             break;

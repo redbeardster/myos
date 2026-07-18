@@ -429,7 +429,7 @@ static void print_msg_line(const struct msg *m) {
             console_putchar('.');
         }
     }
-    console_writestring("\"\nMyOS> ");
+    console_writestring("\"\n");
 }
 
 int msgport_wakeup(struct lwkt_thread *t) {

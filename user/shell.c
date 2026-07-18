@@ -159,7 +159,7 @@ static void cmd_help(void) {
     write_str("  smpbench        - exec spin.elf + SMP snapshot\n");
     write_str("  ksebench [N] [ITERS] - KSE mutex stress with report\n");
     write_str("  ksebench compare [N] [ITERS] - mutex vs parallel (KSE)\n");
-    write_str("  schedmode [m]   - get/set sched (0=legacy runner,1=KSE default)\n");
+    write_str("  schedmode [m]   - exec child sched (0=runner,1=KSE); shell stays KSE\n");
     write_str("  kill <pid>      - kill process by pid (except shell)\n");
     write_str("  killall <name>  - kill all child processes by name\n");
     write_str("  threads         - list LWKT scheduler threads\n");

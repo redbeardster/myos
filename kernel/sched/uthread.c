@@ -411,7 +411,14 @@ static void proc_runner_entry(void *arg) {
         struct proc *p = runner ? runner->user_proc : NULL;
         int resumed;
 
-        if (!p || p->pid == 0 || p->state != PROC_RUNNING || p->runner != runner) {
+        if (!p || p->pid == 0 || p->state != PROC_RUNNING) {
+            lwkt_thread_exit();
+        }
+        /* Heal race: create may schedule before proc_start_runner assigns runner. */
+        if (!p->runner) {
+            p->runner = runner;
+        }
+        if (p->runner != runner) {
             lwkt_thread_exit();
         }
 
@@ -422,7 +429,13 @@ static void proc_runner_entry(void *arg) {
          */
         runner = lwkt_curthread();
         p = runner ? runner->user_proc : NULL;
-        if (!p || p->runner != runner) {
+        if (!p || p->pid == 0 || p->state != PROC_RUNNING) {
+            lwkt_thread_exit();
+        }
+        if (!p->runner) {
+            p->runner = runner;
+        }
+        if (p->runner != runner) {
             lwkt_thread_exit();
         }
 

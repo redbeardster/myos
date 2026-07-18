@@ -27,12 +27,17 @@ int proc_mutex_lock_slot(struct proc_mutex *mutexes, int count, uint32_t id) {
     struct proc *p = proc_current();
     struct uthread *u = uthread_current();
     struct lwkt_thread *self = lwkt_curthread();
-    int user_can_retry = p && u && lwkt_in_usersyscall() && u->lwkt == self;
+    /*
+     * KSE: bound LWKT (u->lwkt == self) — AGAIN + uthread_yield → longjmp.
+     * Runner: never token_lock in syscall; yield back to runner instead.
+     */
+    int user_can_retry = p && u && lwkt_in_usersyscall() &&
+                         (u->lwkt == self || p->sched_mode == PROC_SCHED_RUNNER);
 
     if (tok->holder == self && mutexes[id].uthread_holder != NULL &&
         mutexes[id].uthread_holder != u) {
         if (user_can_retry) {
-            u->user_syscall_ret = MYOS_ERR_AGAIN;
+            u->user_syscall_ret = (uint64_t)MYOS_ERR_AGAIN;
             uthread_yield();
             return MYOS_ERR_AGAIN;
         }
@@ -47,7 +52,7 @@ int proc_mutex_lock_slot(struct proc_mutex *mutexes, int count, uint32_t id) {
     }
 
     if (user_can_retry) {
-        u->user_syscall_ret = MYOS_ERR_AGAIN;
+        u->user_syscall_ret = (uint64_t)MYOS_ERR_AGAIN;
         uthread_yield();
         return MYOS_ERR_AGAIN;
     }

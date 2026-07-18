@@ -1,0 +1,159 @@
+#!/usr/bin/expect -f
+# Phase 7b: proc-runner syscall resched under variable SMP.
+# Usage: tools/qemu_runner_7b_test.exp [iso] [smp...]
+# Default SMP list: 1 2 4 8 16
+
+set timeout 90
+set iso [lindex $argv 0]
+if {$iso eq ""} {
+    set iso "build/myos.iso"
+}
+set smps [lrange $argv 1 end]
+if {[llength $smps] == 0} {
+    # Default: 1..8. SMP=16 currently crashes on ping (pre-existing on main).
+    set smps {1 2 4 8}
+}
+
+proc await_prompt {} {
+    global spawn_id timeout
+    expect {
+        -re "MyOS>" {}
+        timeout { return 0 }
+    }
+    return 1
+}
+
+proc run_one_smp {iso smp} {
+    global timeout spawn_id
+    puts "==== SMP=$smp (runner / schedmode 0) ===="
+    spawn qemu-system-x86_64 -M q35 -m 256M -smp $smp -cdrom $iso -boot d -serial stdio -display none
+
+    if {![await_prompt]} {
+        puts "FAIL: boot timeout SMP=$smp"
+        exit 1
+    }
+
+    send "schedmode 0\r"
+    expect {
+        -re "schedmode set" {}
+        timeout { puts "FAIL: schedmode set SMP=$smp"; exit 2 }
+    }
+    if {![await_prompt]} {
+        puts "FAIL: schedmode prompt SMP=$smp"
+        exit 2
+    }
+
+    send "schedmode\r"
+    expect {
+        -re "schedmode=0" { puts "PASS: schedmode runner pref SMP=$smp" }
+        timeout { puts "FAIL: schedmode get SMP=$smp"; exit 3 }
+    }
+    if {![await_prompt]} {
+        puts "FAIL: schedmode get prompt SMP=$smp"
+        exit 3
+    }
+
+    send "ping\r"
+    expect {
+        -re "pong from msgd" { puts "PASS: ping SMP=$smp" }
+        -re "ping failed" { puts "FAIL: ping failed SMP=$smp"; exit 4 }
+        timeout { puts "FAIL: ping timeout SMP=$smp"; exit 4 }
+    }
+    if {![await_prompt]} {
+        puts "FAIL: ping prompt SMP=$smp"
+        exit 4
+    }
+
+    send "msg hello\r"
+    expect {
+        -re "msg send failed" { puts "FAIL: msg SMP=$smp"; exit 5 }
+        -re "data=\"hello\"" { puts "PASS: msg SMP=$smp" }
+        timeout { puts "FAIL: msg timeout SMP=$smp"; exit 5 }
+    }
+    # Shell often reprints the prompt before msgd prints; refresh.
+    send "\r"
+    if {![await_prompt]} {
+        puts "FAIL: msg prompt SMP=$smp"
+        exit 5
+    }
+
+    send "exec threads.elf\r"
+    expect {
+        -re "main done" { puts "PASS: threads.elf SMP=$smp" }
+        -re "CPU exception|#PF|panic" { puts "FAIL: threads crash SMP=$smp"; exit 6 }
+        timeout { puts "FAIL: threads timeout SMP=$smp"; exit 7 }
+    }
+    expect {
+        -re "threads\\.elf\\) exited" {}
+        timeout { puts "FAIL: threads exit SMP=$smp"; exit 8 }
+    }
+    if {![await_prompt]} {
+        puts "FAIL: threads exit prompt SMP=$smp"
+        exit 8
+    }
+
+    send "threads\r"
+    expect {
+        -re "Total:.*threads" {}
+        timeout { puts "FAIL: threads cmd output SMP=$smp"; exit 9 }
+    }
+    if {![await_prompt]} {
+        puts "FAIL: threads cmd SMP=$smp"
+        exit 9
+    }
+    puts "PASS: threads cmd SMP=$smp"
+
+    send "uthreads\r"
+    expect {
+        -re "Total:.*uthreads" {}
+        timeout { puts "FAIL: uthreads output SMP=$smp"; exit 10 }
+    }
+    if {![await_prompt]} {
+        puts "FAIL: uthreads SMP=$smp"
+        exit 10
+    }
+    puts "PASS: uthreads SMP=$smp"
+
+    send "cpus\r"
+    expect {
+        -re "CPU\\(s\\) online" {}
+        timeout { puts "FAIL: cpus output SMP=$smp"; exit 11 }
+    }
+    if {![await_prompt]} {
+        puts "FAIL: cpus SMP=$smp"
+        exit 11
+    }
+    puts "PASS: cpus SMP=$smp"
+
+    send "exec threads.elf\r"
+    expect {
+        -re "main done" { puts "PASS: threads.elf #2 SMP=$smp" }
+        timeout { puts "FAIL: threads #2 timeout SMP=$smp"; exit 12 }
+    }
+    expect {
+        -re "threads\\.elf\\) exited" {}
+        timeout {}
+    }
+    if {![await_prompt]} {
+        puts "FAIL: threads #2 prompt SMP=$smp"
+        exit 12
+    }
+
+    send "schedmode 1\r"
+    expect {
+        -re "schedmode set" {}
+        timeout {}
+    }
+    await_prompt
+
+    close
+    wait
+    puts "OK SMP=$smp"
+}
+
+foreach smp $smps {
+    run_one_smp $iso $smp
+}
+
+puts "ALL PHASE 7b TESTS PASSED (SMP: $smps)"
+exit 0

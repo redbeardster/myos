@@ -36,9 +36,8 @@ expect {
     -re "threads\\.elf\\) exited" { }
     timeout { puts "FAIL: threads exit timeout"; exit 4 }
 }
+expect -re "MyOS>"
 
-send "\r"
-after 500
 send "ksebench 4 2000\r"
 
 expect {

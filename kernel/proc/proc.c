@@ -17,6 +17,8 @@
 static struct proc proc_table[MAX_PROCS];
 static uint32_t next_pid = 1;
 static spinlock_t proc_table_lock;
+/* schedmode on the shell selects mode for subsequent exec children (shell stays KSE). */
+static uint32_t exec_sched_mode = PROC_SCHED_KSE;
 
 static int proc_alloc_cap_slot(struct proc *p) {
     if (!p) {
@@ -206,7 +208,8 @@ struct proc *proc_create(const char *name, uint64_t cr3, uint64_t entry,
     p->heap_next = MYOS_USER_HEAP_START;
     p->stack_next = MYOS_USER_STACK_TOP;
     p->is_shell = is_shell;
-    p->sched_mode = PROC_SCHED_KSE;
+    /* Shell always runs KSE (1:1 LWKT); children take exec_sched_mode. */
+    p->sched_mode = is_shell ? PROC_SCHED_KSE : exec_sched_mode;
     p->uthread_count = 0;
     p->threads = NULL;
     p->main_thread = NULL;
@@ -636,6 +639,11 @@ int proc_set_sched_mode(struct proc *p, uint32_t mode) {
     if (mode != PROC_SCHED_RUNNER && mode != PROC_SCHED_KSE) {
         return -2;
     }
+    if (p->is_shell) {
+        /* Preference for exec children only — do not retarget the live shell. */
+        exec_sched_mode = mode;
+        return 0;
+    }
     p->sched_mode = mode;
     return 0;
 }
@@ -643,6 +651,9 @@ int proc_set_sched_mode(struct proc *p, uint32_t mode) {
 int proc_get_sched_mode(struct proc *p) {
     if (!p) {
         return -1;
+    }
+    if (p->is_shell) {
+        return (int)exec_sched_mode;
     }
     return (int)p->sched_mode;
 }

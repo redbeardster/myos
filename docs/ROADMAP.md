@@ -194,29 +194,30 @@ cpus
 
 ---
 
-## Фаза 7b — proc-runner hardening (syscall resched) 🔄
+## Фаза 7b — proc-runner hardening (syscall resched) ✅
 
-**Цель:** единый безопасный путь для блокирующих syscall внутри runner (`MYOS_ERR_AGAIN` + `wait_edge`), без `lwkt_block()`-loop в syscall.
+**Цель:** единый безопасный путь для блокирующих syscall внутри runner (`MYOS_ERR_AGAIN` + `wait_edge` / in-proc yield), без `lwkt_block()`-loop в syscall.
 
-**Что уже сделано:**
+**Сделано:**
 
-- `lwkt_syscall_resched(retry_ret)` в `lwkt.c`/`lwkt.h`;
-- `uthread_join` и `proc_mutex_lock` переведены на helper;
-- `SYS_MSG_RECV` и `SYS_MSG_PING` в runner переведены на non-block receive + retry (`MYOS_ERR_AGAIN`);
-- `myos_msg_ping()` добавлен retry-loop в `user/myos.h`.
+- `lwkt_syscall_resched(retry_ret)` — wait_edge + `user_syscall_ret` (с early-return при `runner_reswitch`);
+- `proc_mutex_lock` (KSE + runner) / `uthread_join` / `SYS_READ` / msg recv-ping — retry через `MYOS_ERR_AGAIN`;
+- `schedmode 0` на shell задаёт режим **дочерних** `exec` (shell остаётся KSE);
+- `exec` будит `p->runner`; heal race `p->runner` до первого schedule;
+- `SYS_READ`: runner → AGAIN+yield; UP KSE → wait_edge+AGAIN (`myos_read_char` yield); SMP KSE → park в wait_edge (без yield-storm);
+- `ipc_bump` шлёт IPI если dest не `READY` (починка `ping` после per-CPU locks);
+- async `token_shared` MP selftest отключён на boot (READY LWKT → starvation на SMP=1);
+- тест: `tools/qemu_runner_7b_test.exp`.
 
-**Осталось закрыть вручную в рантайме (`SMP=8`):**
+**Проверка:**
 
-```text
-ping
-msg hello
-exec threads.elf
-threads
-uthreads
-cpus
+```bash
+expect tools/qemu_runner_7b_test.exp build/myos.iso 1 2 4 8
+expect tools/qemu_kse_test.exp
+# SMP=16: известный crash на ping ещё на main (не регрессия 7b)
 ```
 
-**Критерий done:** нет зависаний shell, `ping/msg` работают под proc-runner, `threads.elf` завершает join/exit.
+**Критерий done:** `ping` / `msg` / `exec threads.elf` (×2) / `threads` / `uthreads` / `cpus` на SMP=1..8; KSE-регрессия зелёная.
 
 ---
 

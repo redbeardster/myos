@@ -893,11 +893,22 @@ void lwkt_sched_stop(void) {
 
 void lwkt_ipc_bump(struct lwkt_thread *t) {
     ipc_bump_attempts++;
-    if (!t || t->state != THREAD_READY) {
+    if (!t) {
         return;
     }
     if (!ipc_bump_enabled) {
         ipc_bump_skipped_disabled++;
+        /* Still IPI: receiver may be RUNNING in wait_edge (ping/PONG). */
+        lwkt_sched_ipi_thread(t);
+        return;
+    }
+
+    if (t->state != THREAD_READY) {
+        /*
+         * Not on a run queue (e.g. RUNNING in SYS_READ/msg wait_edge).
+         * Queue bump does not apply; IPI so the CPU leaves hlt / reschedules.
+         */
+        lwkt_sched_ipi_thread(t);
         return;
     }
 
@@ -909,18 +920,16 @@ void lwkt_ipc_bump(struct lwkt_thread *t) {
     }
     t->last_ipc_bump_tick = now;
 
-    if (t->state == THREAD_READY) {
-        remove_from_queues(t);
-        struct cpu *dest = pick_enqueue_cpu(NULL);
-        if (!dest) {
-            dest = this_cpu();
-        }
-        uint64_t irqf = cpu_irq_save();
-        queue_lock(dest);
-        enqueue_on_cpu_head(dest, t);
-        queue_unlock(dest);
-        cpu_irq_restore(irqf);
+    remove_from_queues(t);
+    struct cpu *dest = pick_enqueue_cpu(NULL);
+    if (!dest) {
+        dest = this_cpu();
     }
+    uint64_t irqf = cpu_irq_save();
+    queue_lock(dest);
+    enqueue_on_cpu_head(dest, t);
+    queue_unlock(dest);
+    cpu_irq_restore(irqf);
     ipc_bump_applied++;
     lwkt_sched_ipi_thread(t);
 }

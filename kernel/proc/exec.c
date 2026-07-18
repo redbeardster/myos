@@ -112,9 +112,10 @@ int exec_spawn_elf(const void *elf, size_t size, const char *name, uint32_t flag
             proc_destroy(p);
             return -8;
         }
+        lwkt_sched_ipi_thread(p->runner);
+    } else if (u->lwkt) {
+        lwkt_sched_ipi_thread(u->lwkt);
     }
-
-    lwkt_sched_ipi_thread(u->lwkt);
     return (int)p->pid;
 }
 
