@@ -212,12 +212,11 @@ cpus
 **Проверка:**
 
 ```bash
-expect tools/qemu_runner_7b_test.exp build/myos.iso 1 2 4 8
+expect tools/qemu_runner_7b_test.exp build/myos.iso 1 2 4 8 16
 expect tools/qemu_kse_test.exp
-# SMP=16: известный crash на ping ещё на main (не регрессия 7b)
 ```
 
-**Критерий done:** `ping` / `msg` / `exec threads.elf` (×2) / `threads` / `uthreads` / `cpus` на SMP=1..8; KSE-регрессия зелёная.
+**Критерий done:** `ping` / `msg` / `exec threads.elf` (×2) / `threads` / `uthreads` / `cpus` на SMP=1..8 (и 16 после поднятия `MAX_CPUS`); KSE-регрессия зелёная.
 
 ---
 

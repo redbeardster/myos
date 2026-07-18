@@ -141,7 +141,12 @@ void smp_lapic_entry(struct LIMINE_MP(info) *info) {
         }
     }
 
-    cpu_init_ap(info->lapic_id);
+    if (!cpu_init_ap(info->lapic_id)) {
+        /* Beyond MAX_CPUS — stay parked; do not touch scheduler/GS. */
+        for (;;) {
+            __asm__ volatile("cli; hlt");
+        }
+    }
 
     __atomic_fetch_add(&aps_waiting, 1, __ATOMIC_SEQ_CST);
 
@@ -156,19 +161,39 @@ void smp_lapic_entry(struct LIMINE_MP(info) *info) {
     lwkt_ap_bootstrap();
 }
 
+static void smp_park_ap(struct LIMINE_MP(info) *info) {
+    (void)info;
+    __asm__ volatile("cli");
+    for (;;) {
+        __asm__ volatile("hlt");
+    }
+}
+
 void smp_init(volatile struct LIMINE_MP(response) *smp) {
     if (!smp || smp->cpu_count <= 1) {
         console_writestring("SMP: single CPU (no APs)\n");
         return;
     }
 
+    uint64_t limine_n = smp->cpu_count;
+    uint64_t want = limine_n;
+    if (want > MAX_CPUS) {
+        want = MAX_CPUS;
+    }
+
     console_writestring("SMP: booting ");
-    console_write_dec(smp->cpu_count - 1);
+    console_write_dec(want - 1);
     console_writestring(" AP(s), BSP lapic=");
     console_write_dec(smp->bsp_lapic_id);
+    if (limine_n > want) {
+        console_writestring(" (capped from ");
+        console_write_dec(limine_n);
+        console_writestring(")");
+    }
     console_putchar('\n');
 
-    for (uint64_t i = 0; i < smp->cpu_count; i++) {
+    uint64_t accepted = 1; /* BSP already online */
+    for (uint64_t i = 0; i < limine_n; i++) {
         struct LIMINE_MP(info) *info = smp->cpus[i];
         if (!info) {
             continue;
@@ -176,10 +201,15 @@ void smp_init(volatile struct LIMINE_MP(response) *smp) {
         if (info->lapic_id == smp->bsp_lapic_id) {
             continue;
         }
-        __atomic_store_n(&info->goto_address, smp_lapic_entry, __ATOMIC_RELEASE);
+        if (accepted < want) {
+            __atomic_store_n(&info->goto_address, smp_lapic_entry, __ATOMIC_RELEASE);
+            accepted++;
+        } else {
+            __atomic_store_n(&info->goto_address, smp_park_ap, __ATOMIC_RELEASE);
+        }
     }
 
-    while ((uint32_t)__atomic_load_n(&aps_waiting, __ATOMIC_SEQ_CST) + 1 < smp->cpu_count) {
+    while ((uint32_t)__atomic_load_n(&aps_waiting, __ATOMIC_SEQ_CST) + 1 < want) {
         __asm__ volatile("pause");
     }
 

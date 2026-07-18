@@ -8,7 +8,7 @@
 #include "lwkt.h"
 #include "spinlock.h"
 
-#define MAX_CPUS 8
+#define MAX_CPUS 16
 
 struct cpu {
     struct cpu *self;

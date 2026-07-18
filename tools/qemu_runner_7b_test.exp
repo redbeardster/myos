@@ -10,17 +10,23 @@ if {$iso eq ""} {
 }
 set smps [lrange $argv 1 end]
 if {[llength $smps] == 0} {
-    # Default: 1..8. SMP=16 currently crashes on ping (pre-existing on main).
-    set smps {1 2 4 8}
+    set smps {1 2 4 8 16}
 }
 
-proc await_prompt {} {
+proc await_prompt {{nudge 0}} {
     global spawn_id timeout
     expect {
-        -re "MyOS>" {}
-        timeout { return 0 }
+        -re "MyOS>" { return 1 }
+        timeout {}
     }
-    return 1
+    if {$nudge} {
+        send "\r"
+        expect {
+            -re "MyOS>" { return 1 }
+            timeout { return 0 }
+        }
+    }
+    return 0
 }
 
 proc run_one_smp {iso smp} {
@@ -59,7 +65,7 @@ proc run_one_smp {iso smp} {
         -re "ping failed" { puts "FAIL: ping failed SMP=$smp"; exit 4 }
         timeout { puts "FAIL: ping timeout SMP=$smp"; exit 4 }
     }
-    if {![await_prompt]} {
+    if {![await_prompt 1]} {
         puts "FAIL: ping prompt SMP=$smp"
         exit 4
     }

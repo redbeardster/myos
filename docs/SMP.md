@@ -37,6 +37,7 @@ per-CPU run queues и `queue_lock`, `thread_pool_lock`, LAPIC timer и targeted 
 1. Limine передаёт `limine_smp_response` (запрос в `kernel/main.c`).
 2. BSP: `cpu_init_bsp()` — LAPIC, `struct cpu`, MSR `KERNEL_GS_BASE`.
 3. `smp_init()` — для каждого AP: атомарная запись `goto_address = smp_lapic_entry` (Limine будит AP; **не вызывать** эту функцию с BSP).
+   Лимит: `MAX_CPUS` (сейчас 16) и TSS на CPU; лишние AP Limine паркуются в `smp_park_ap` (hlt), без планировщика.
 4. AP: `cpu_init_ap()`, барьер, `interrupts_enable()`, `lwkt_cpu_init_idle()`, LAPIC timer, `lwkt_ap_bootstrap()`.
 5. BSP: `smp_release_aps()` — PIT off, LAPIC timer на BSP, `lwkt_sched_enable()`.
 6. BSP: `lwkt_bootstrap_first()` — shell как `RUNNING` на BSP, затем `smp_start_aps()`.
@@ -71,7 +72,7 @@ SMP: all CPUs online (2 total)
 ## 4. Проверка (SMP=8)
 
 ```bash
-make && qemu-system-x86_64 -M q35 -m 256M -smp 8 -cdrom build/myos.iso -boot d -serial stdio -display none
+make && qemu-system-x86_64 -M q35 -m 256M -smp 16 -cdrom build/myos.iso -boot d -serial stdio -display none
 ```
 
 ```text

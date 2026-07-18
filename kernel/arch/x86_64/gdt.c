@@ -4,7 +4,7 @@
 
 #include <stdint.h>
 
-#define MAX_TSS_CPUS 8
+#define MAX_TSS_CPUS MAX_CPUS
 
 struct gdt_entry {
     uint16_t limit_low;
