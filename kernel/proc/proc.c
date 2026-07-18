@@ -313,7 +313,6 @@ static void proc_wake_shell(void) {
     if (shell_lwkt) {
         lwkt_nudge(shell_lwkt);
     }
-    lwkt_sched_ipi_others();
 }
 
 /*
@@ -327,17 +326,26 @@ void proc_shell_serial_kick(void) {
 
     uint64_t irqf;
     struct proc *shell_proc;
+    struct lwkt_thread *shell_lwkt = NULL;
 
     spin_lock_irqsave(&proc_table_lock, &irqf);
     shell_proc = proc_find_shell_locked();
     if (shell_proc) {
         shell_proc->read_wake = 1;
+        if (shell_proc->main_thread && shell_proc->main_thread->lwkt) {
+            shell_lwkt = shell_proc->main_thread->lwkt;
+        } else if (shell_proc->current_uthread && shell_proc->current_uthread->lwkt) {
+            shell_lwkt = shell_proc->current_uthread->lwkt;
+        } else if (shell_proc->runner) {
+            shell_lwkt = shell_proc->runner;
+        }
     }
     spin_unlock_irqrestore(&proc_table_lock, irqf);
 
-    if (shell_proc) {
+    if (shell_lwkt) {
+        lwkt_nudge(shell_lwkt);
+    } else if (shell_proc) {
         lwkt_preempt_request();
-        lwkt_sched_ipi_others();
     }
 }
 
@@ -391,10 +399,16 @@ static void proc_destroy_aspace(uint64_t cr3) {
 static void proc_request_kill_locked(struct proc *p,
                                      struct lwkt_thread **wake_list,
                                      int *wake_count,
-                                     int wake_max) {
+                                     int wake_max,
+                                     struct lwkt_thread **ipi_list,
+                                     int *ipi_count,
+                                     int ipi_max) {
     for (struct uthread *u = p->threads; u; u = u->next_in_proc) {
         if (u->lwkt && u->lwkt->id) {
             u->lwkt->pending_kill = 1;
+            if (ipi_list && ipi_count && *ipi_count < ipi_max) {
+                ipi_list[(*ipi_count)++] = u->lwkt;
+            }
             if (u->lwkt->state == THREAD_BLOCKED && wake_list && wake_count &&
                 *wake_count < wake_max) {
                 wake_list[(*wake_count)++] = u->lwkt;
@@ -403,6 +417,9 @@ static void proc_request_kill_locked(struct proc *p,
     }
     if (p->runner && p->runner->id) {
         p->runner->pending_kill = 1;
+        if (ipi_list && ipi_count && *ipi_count < ipi_max) {
+            ipi_list[(*ipi_count)++] = p->runner;
+        }
         if (p->runner->state == THREAD_BLOCKED && wake_list && wake_count &&
             *wake_count < wake_max) {
             wake_list[(*wake_count)++] = p->runner;
@@ -420,7 +437,9 @@ void proc_destroy(struct proc *p) {
 
     uint64_t irqf;
     struct lwkt_thread *wake_list[8];
+    struct lwkt_thread *ipi_list[MAX_THREADS];
     int wake_count = 0;
+    int ipi_count = 0;
 
     spin_lock_irqsave(&proc_table_lock, &irqf);
 
@@ -428,12 +447,13 @@ void proc_destroy(struct proc *p) {
     int on_proc_lwkt = cur && cur->user_proc == p;
 
     if (!on_proc_lwkt && (p->uthread_count > 0 || p->runner)) {
-        proc_request_kill_locked(p, wake_list, &wake_count, 8);
+        proc_request_kill_locked(p, wake_list, &wake_count, 8, ipi_list, &ipi_count,
+                                 MAX_THREADS);
         spin_unlock_irqrestore(&proc_table_lock, irqf);
         for (int i = 0; i < wake_count; i++) {
             lwkt_unblock(wake_list[i]);
         }
-        lwkt_sched_ipi_others();
+        lwkt_sched_ipi_threads(ipi_list, ipi_count);
         return;
     }
 
@@ -444,12 +464,14 @@ void proc_destroy(struct proc *p) {
 
     if (p->runner && cur != p->runner) {
         wake_count = 0;
-        proc_request_kill_locked(p, wake_list, &wake_count, 8);
+        ipi_count = 0;
+        proc_request_kill_locked(p, wake_list, &wake_count, 8, ipi_list, &ipi_count,
+                                 MAX_THREADS);
         spin_unlock_irqrestore(&proc_table_lock, irqf);
         for (int i = 0; i < wake_count; i++) {
             lwkt_unblock(wake_list[i]);
         }
-        lwkt_sched_ipi_others();
+        lwkt_sched_ipi_threads(ipi_list, ipi_count);
         return;
     }
 
@@ -493,9 +515,23 @@ static int proc_is_dead(uint32_t pid) {
     return !p || p->pid == 0;
 }
 
-static void proc_kill_nudge(void) {
-    lwkt_sched_ipi_others();
+static void proc_kill_nudge(uint32_t pid) {
+    struct proc *p = find_proc(pid);
+    if (p && p->state == PROC_RUNNING) {
+        proc_sched_nudge(p);
+    }
     __asm__ volatile("sti; hlt" ::: "memory");
+}
+
+static int proc_kill_wait_dead(uint32_t pid) {
+    uint32_t start = (uint32_t)timer_get_ticks();
+    while ((uint32_t)(timer_get_ticks() - start) < PROC_KILL_WAIT_TICKS) {
+        if (proc_is_dead(pid)) {
+            return 0;
+        }
+        proc_kill_nudge(pid);
+    }
+    return proc_is_dead(pid) ? 0 : -4;
 }
 
 static int proc_kill_request(uint32_t pid) {
@@ -529,17 +565,6 @@ static int proc_kill_request(uint32_t pid) {
 
     proc_destroy(p);
     return 0;
-}
-
-static int proc_kill_wait_dead(uint32_t pid) {
-    uint32_t start = (uint32_t)timer_get_ticks();
-    while ((uint32_t)(timer_get_ticks() - start) < PROC_KILL_WAIT_TICKS) {
-        if (proc_is_dead(pid)) {
-            return 0;
-        }
-        proc_kill_nudge();
-    }
-    return proc_is_dead(pid) ? 0 : -4;
 }
 
 int proc_kill(uint32_t pid) {

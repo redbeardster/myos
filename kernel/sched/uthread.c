@@ -167,7 +167,7 @@ static void uthread_record_join(struct uthread *u) {
         join_exit_code[id] = u->exit_code;
     }
     __atomic_store_n(&join_exit_valid[id], 1, __ATOMIC_RELEASE);
-    lwkt_sched_ipi_others();
+    /* Joiner sees the flag via ACQUIRE load; wake is uthread_wakeup_joiner(). */
 }
 
 static int uthread_join_zombie(struct uthread *u, struct proc *p, int *exit_code_out) {
@@ -237,7 +237,7 @@ static void uthread_wakeup_joiner(struct uthread *u) {
             lwkt_unblock(w->lwkt);
             lwkt_nudge(w->lwkt);
         } else {
-            lwkt_sched_ipi_others();
+            proc_sched_nudge(w->proc);
         }
         return;
     }
@@ -343,8 +343,9 @@ void proc_runner_resched(struct proc *p) {
     }
     if (p->runner->state == THREAD_BLOCKED) {
         lwkt_unblock(p->runner);
+    } else {
+        lwkt_sched_ipi_thread(p->runner);
     }
-    lwkt_sched_ipi_others();
 }
 
 void proc_sched_nudge(struct proc *p) {
@@ -355,7 +356,15 @@ void proc_sched_nudge(struct proc *p) {
         proc_runner_resched(p);
         return;
     }
-    lwkt_sched_ipi_others();
+
+    struct lwkt_thread *ts[MAX_THREADS];
+    int n = 0;
+    for (struct uthread *u = p->threads; u && n < MAX_THREADS; u = u->next_in_proc) {
+        if (u->lwkt && u->lwkt->id) {
+            ts[n++] = u->lwkt;
+        }
+    }
+    lwkt_sched_ipi_threads(ts, n);
 }
 
 static void uthread_return_to_runner(struct proc *p) {

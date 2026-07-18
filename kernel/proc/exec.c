@@ -114,7 +114,7 @@ int exec_spawn_elf(const void *elf, size_t size, const char *name, uint32_t flag
         }
     }
 
-    lwkt_sched_ipi_others();
+    lwkt_sched_ipi_thread(u->lwkt);
     return (int)p->pid;
 }
 

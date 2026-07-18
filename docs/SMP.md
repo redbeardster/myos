@@ -64,7 +64,7 @@ SMP: all CPUs online (2 total)
 - per-CPU: `steals`, `same_proc_pulls`, `ipi_rx`
 - глобально: `ipi_targeted`, `ipi_local`, `ipi_broadcast`
 
-Ожидание на горячем пути: **targeted ≫ broadcast** (broadcast на join/kill пока допустим).
+Ожидание на горячем пути: **targeted ≫ broadcast**. Broadcast остаётся только как явный API `lwkt_sched_ipi_others` (сейчас без call sites на kill/join/exec/nudge).
 
 ---
 
@@ -89,4 +89,4 @@ cpus
 
 ## 5. Следующий шаг
 
-Сузить broadcast на kill/join (больше targeted wakes). UART IRQ вместо serial poll в `wait_edge`.
+UART IRQ вместо serial poll в `wait_edge` (опционально; GUI-отладка достаточна). Дальнейший тюнинг steal/fairness.

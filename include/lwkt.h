@@ -86,6 +86,7 @@ void lwkt_sched_stop(void);
 void lwkt_sched_enable(void);
 void lwkt_sched_ipi_cpu(struct cpu *dest);
 void lwkt_sched_ipi_thread(struct lwkt_thread *t);
+void lwkt_sched_ipi_threads(struct lwkt_thread *const *threads, int count);
 void lwkt_sched_ipi_others(void);
 
 struct lwkt_thread *lwkt_create(const char *name, void (*entry)(void *), void *arg, uint32_t priority);

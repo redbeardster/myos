@@ -829,7 +829,6 @@ void lwkt_sched_enable(void) {
 
 void lwkt_sched_ipi_cpu(struct cpu *dest) {
     if (!dest || !dest->online) {
-        lwkt_sched_ipi_others();
         return;
     }
     struct cpu *self = this_cpu();
@@ -843,11 +842,36 @@ void lwkt_sched_ipi_cpu(struct cpu *dest) {
 }
 
 void lwkt_sched_ipi_thread(struct lwkt_thread *t) {
-    if (!t) {
-        lwkt_sched_ipi_others();
+    if (!t || !t->id) {
         return;
     }
     lwkt_sched_ipi_cpu(cpu_for_thread_wake(t));
+}
+
+/* Dedup by destination CPU — one resched IPI per core. */
+void lwkt_sched_ipi_threads(struct lwkt_thread *const *threads, int count) {
+    if (!threads || count <= 0) {
+        return;
+    }
+    uint64_t seen = 0;
+    for (int i = 0; i < count; i++) {
+        struct lwkt_thread *t = threads[i];
+        if (!t || !t->id) {
+            continue;
+        }
+        struct cpu *dest = cpu_for_thread_wake(t);
+        if (!dest || !dest->online) {
+            continue;
+        }
+        if (dest->id < 64) {
+            uint64_t bit = 1ULL << dest->id;
+            if (seen & bit) {
+                continue;
+            }
+            seen |= bit;
+        }
+        lwkt_sched_ipi_cpu(dest);
+    }
 }
 
 void lwkt_sched_ipi_others(void) {
