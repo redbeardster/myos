@@ -1,31 +1,32 @@
 # MyOS — SMP (Symmetric Multiprocessing)
 
 Этап 2: запуск Application Processors (AP) через Limine, per-CPU состояние,
-глобальная очередь LWKT под spinlock, LAPIC timer для вытеснения.
+per-CPU run queues, глобальный `sched_lock`, LAPIC timer и targeted IPI.
 
 ---
 
 ## 1. Архитектура
 
 ```
-                    ┌─────────────────────────────────┐
-                    │  sched_lock (global, фаза 1)    │
-                    └───────────────┬─────────────────┘
-                                    │
-         ┌──────────────────────────┼──────────────────────────┐
-         ▼                          ▼                          ▼
-   ┌───────────┐            ┌───────────┐            ┌───────────┐
-   │ CPU 0 BSP │            │ CPU 1 AP  │            │ CPU N AP  │
-   │ run_queues│            │ run_queues│            │ run_queues│
-   │ idle/cur  │            │ idle/cur  │            │ idle/cur  │
-   │ work steal│◄──────────►│ work steal│            │           │
-   └───────────┘            └───────────┘            └───────────┘
+              ┌──────────────────────────────────────┐
+              │  sched_lock (глобальный, irqsave)     │
+              └──────────────────┬───────────────────┘
+                                 │
+      ┌──────────────────────────┼──────────────────────────┐
+      ▼                          ▼                          ▼
+┌───────────┐            ┌───────────┐            ┌───────────┐
+│ CPU 0 BSP │            │ CPU 1 AP  │            │ CPU N AP  │
+│ run_queues│            │ run_queues│            │ run_queues│
+│ idle/cur  │            │ idle/cur  │            │ idle/cur  │
+│ work steal│◄──────────►│ work steal│            │           │
+└───────────┘            └───────────┘            └───────────┘
 ```
 
-- **Per-CPU** `run_queues[MAX_PRIORITY]` в `struct cpu`.
-- Поток ставится в очередь **текущего CPU** (`enqueue_thread`).
-- Пустой CPU **крадёт** поток с другого CPU (`dequeue_thread`).
-- Общий пул `thread_pool[]` без изменений.
+- **Per-CPU** `run_queues[MAX_PRIORITY]` в `struct cpu` (очередь локальная).
+- Поток ставится через `pick_enqueue_cpu` / `enqueue_on_cpu`.
+- Пустой CPU **крадёт** работу с другого CPU (`dequeue_thread`).
+- Синхронизация очередей: пока **глобальный** `sched_lock` (per-CPU `queue_lock` отложен — гонки на SMP=8).
+- Wake: **targeted IPI** на `run_cpu` / owner (`lwkt_sched_ipi_cpu` / `lwkt_sched_ipi_thread`); broadcast — fallback.
 
 Дорожная карта: [ROADMAP.md](ROADMAP.md).
 
@@ -50,97 +51,41 @@ SMP: all CPUs online (2 total)
 
 ---
 
-## 3. Таймер и вытеснение
+## 3. Targeted IPI и метрики
 
-| Режим | Таймер |
-|-------|--------|
-| До `smp_release_aps` (ранний init) | PIT ~100 Hz (только если 1 CPU в `lwkt_sched_start`) |
-| После SMP release | LAPIC timer vector **64** на каждом CPU |
-| Wake / unblock | IPI vector **65** → `lwkt_preempt_check()` на удалённых CPU |
+| API | Назначение |
+|-----|------------|
+| `lwkt_sched_ipi_cpu(dest)` | resched на один CPU (local → `preempt_requested`) |
+| `lwkt_sched_ipi_thread(t)` | dest = owner / `run_cpu` |
+| `lwkt_sched_ipi_others()` | broadcast (kill wait, join record, fallback) |
 
-Обработчик таймера: `interrupt.c` → `lwkt_preempt_request()` → `lwkt_preempt_check()`.
+Счётчики (см. `cpus` / `smpbalance` / `threads`):
 
-IPI reschedule: `lapic_ipi_reschedule_others()` из `lwkt_unblock()` / `lwkt_create()`.
+- per-CPU: `steals`, `same_proc_pulls`, `ipi_rx`
+- глобально: `ipi_targeted`, `ipi_local`, `ipi_broadcast`
 
----
-
-## 4. Per-CPU доступ
-
-```c
-struct cpu *cpu_current(void);  /* mov gs:0 — поле self в struct cpu */
-```
-
-Каждый CPU при инициализации:
-
-```c
-cpu->self = cpu;
-wrmsr(KERNEL_GS_BASE, cpu);
-gdt_load_tss(cpu->id);
-```
+Ожидание на горячем пути: **targeted ≫ broadcast**.
 
 ---
 
-## 5. Блокировки (SMP-safe)
-
-| Ресурс | Механизм |
-|--------|----------|
-| Run queue / LWKT pool | `sched_lock` (spinlock) |
-| `proc_table` | `proc_table_lock` |
-| Page allocator | `page_lock` |
-| Console | `console_lock` |
-| Proc mutex | `proc_mutex.guard` + wait queue |
-
----
-
-## 6. Проверка SMP
+## 4. Проверка (SMP=8)
 
 ```bash
-make run    # QEMU: -smp 2
+make && qemu-system-x86_64 -M q35 -m 256M -smp 8 -cdrom build/myos.iso -boot d -serial stdio -display none
 ```
-
-В shell:
 
 ```text
-cpus              # оба CPU: sched on, idle/shell, счётчик switches
-exec threads.elf  # многопоточный тест
-cpus              # switches растут на CPU 0 и CPU 1
-threads           # колонка CPU у running-потоков
+ping
+exec threads.elf
+# worker start/done, join counter=10, main done, Process exited
+smpbalance
+cpus
 ```
 
-Без `-smp` Limine может отдать 1 CPU — ядро пишет `SMP: single CPU (no APs)`.
+Автотест: `expect tools/qemu_kse_test.exp`
 
 ---
 
-## 7. Ограничения
+## 5. Следующий шаг
 
-- `sched_lock` пока глобальный (per-CPU lock — опционально в ROADMAP).
-- IPI broadcast «всем кроме себя» — простой wake; без точечной доставки на один CPU.
-- Work steal без affinity — поток может переехать на другой CPU после steal.
-
-`msgport` переведён на **sleepable token** (см. [TOKEN.md](TOKEN.md)).
-
----
-
-## 8. Ключевые файлы
-
-| Файл | Назначение |
-|------|------------|
-| `include/cpu.h` | `struct cpu`, SMP API |
-| `kernel/arch/x86_64/smp.c` | Limine AP boot, барьер |
-| `kernel/arch/x86_64/lapic.c` | LAPIC MMIO, timer |
-| `kernel/arch/x86_64/gdt.c` | TSS per CPU |
-| `kernel/sched/lwkt.c` | Планировщик + `sched_lock` |
-| `kernel/sched/token.c` | Sleepable token |
-| `kernel/sched/msgport.c` | Почта LWKT под token |
-| `kernel/main.c` | `limine_smp_request` |
-
----
-
-## 9. Следующие шаги
-
-См. [ROADMAP.md](ROADMAP.md): `token_shared`, `proc_mutex`→token, msgport по имени, `kbdd` IPC.
-
-- Точечный IPI на конкретный lapic_id
-- Shared (read) token для read-mostly подсистем
-
-См. [DEVELOPMENT.md](DEVELOPMENT.md), [THREADS_DEMO.md](THREADS_DEMO.md).
+Per-CPU `queue_lock` + `thread_pool_lock` (без глобального `sched_lock`) — только после стабильного steal/idle-wake протокола на SMP=8.

@@ -23,6 +23,9 @@ struct cpu {
     int sched_active;
     uint64_t bootstrap_rsp;
     uint64_t switches;
+    uint64_t steals;
+    uint64_t same_proc_pulls;
+    uint64_t ipi_rx;
 };
 
 struct cpu *cpu_current(void);

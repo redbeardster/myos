@@ -27,10 +27,28 @@ static uint64_t ipc_bump_attempts;
 static uint64_t ipc_bump_applied;
 static uint64_t ipc_bump_skipped_debounce;
 static uint64_t ipc_bump_skipped_disabled;
+static uint64_t ipi_targeted;
+static uint64_t ipi_local;
+static uint64_t ipi_broadcast;
 
 static struct cpu *this_cpu(void);
 static void strcpy_local(char *dst, const char *src);
 static int thread_owner_cpu_id(struct lwkt_thread *t);
+
+static struct cpu *cpu_for_thread_wake(struct lwkt_thread *t) {
+    int owner = thread_owner_cpu_id(t);
+    struct cpu *dest = NULL;
+    if (owner >= 0) {
+        dest = cpu_by_id((uint32_t)owner);
+    }
+    if ((!dest || !dest->online) && t) {
+        dest = cpu_by_id(t->run_cpu);
+    }
+    if (!dest || !dest->online) {
+        dest = this_cpu();
+    }
+    return dest;
+}
 
 static void cpu_run_queues_init(struct cpu *cpu) {
     if (!cpu) {
@@ -203,6 +221,7 @@ static struct lwkt_thread *dequeue_thread(struct cpu *cpu, struct lwkt_thread *s
             }
             if (t->uthread && t->uthread->proc == proc) {
                 t->run_cpu = cpu->id;
+                cpu->same_proc_pulls++;
                 return t;
             }
             enqueue_on_cpu(other, t);
@@ -225,6 +244,7 @@ static struct lwkt_thread *dequeue_thread(struct cpu *cpu, struct lwkt_thread *s
         t = dequeue_from_cpu(other, NULL, 0);
         if (t) {
             t->run_cpu = cpu->id;
+            cpu->steals++;
             return t;
         }
     }
@@ -277,8 +297,12 @@ static int idle_should_yield(struct cpu *cpu) {
     if (!cpu) {
         return 0;
     }
+    /*
+     * Contended sched_lock often means another CPU is enqueueing for us —
+     * do not sleep; retry after a brief pause.
+     */
     if (!spin_trylock(&sched_lock)) {
-        return 0;
+        return 1;
     }
     int wake = cpu_has_ready_peer(cpu) || any_cpu_has_ready_user_runner();
     spin_unlock(&sched_lock);
@@ -524,8 +548,15 @@ static void idle_worker(void *arg) {
             lwkt_yield();
             continue;
         }
-        cpu->preempt_requested = 0;
-        __asm__ volatile("sti; hlt" ::: "memory");
+        /*
+         * Classic idle race: clearing preempt_requested then sti;hlt loses a
+         * wake that arrives after the clear. Enable IRQs, recheck, then hlt.
+         */
+        __asm__ volatile("sti" ::: "memory");
+        if (cpu->preempt_requested || idle_should_yield(cpu)) {
+            continue;
+        }
+        __asm__ volatile("hlt" ::: "memory");
     }
 }
 
@@ -584,6 +615,9 @@ void lwkt_init(void) {
     cpu_run_queues_init(this_cpu());
     thread_count = 0;
     sched_active = 0;
+    ipi_targeted = 0;
+    ipi_local = 0;
+    ipi_broadcast = 0;
 
     msgport_init();
 }
@@ -602,8 +636,32 @@ void lwkt_sched_enable(void) {
     }
 }
 
+void lwkt_sched_ipi_cpu(struct cpu *dest) {
+    if (!dest || !dest->online) {
+        lwkt_sched_ipi_others();
+        return;
+    }
+    struct cpu *self = this_cpu();
+    if (dest == self) {
+        ipi_local++;
+        lwkt_preempt_request();
+        return;
+    }
+    ipi_targeted++;
+    lapic_ipi_send(dest->lapic_id, LAPIC_IPI_RESCHED_VECTOR);
+}
+
+void lwkt_sched_ipi_thread(struct lwkt_thread *t) {
+    if (!t) {
+        lwkt_sched_ipi_others();
+        return;
+    }
+    lwkt_sched_ipi_cpu(cpu_for_thread_wake(t));
+}
+
 void lwkt_sched_ipi_others(void) {
     if (cpu_online_count() > 1) {
+        ipi_broadcast++;
         lapic_ipi_reschedule_others();
     }
 }
@@ -652,7 +710,7 @@ void lwkt_ipc_bump(struct lwkt_thread *t) {
     }
     sched_unlock_irqrestore(irqf);
     ipc_bump_applied++;
-    lwkt_sched_ipi_others();
+    lwkt_sched_ipi_thread(t);
 }
 
 int lwkt_ipc_bump_mode(int mode) {
@@ -724,7 +782,7 @@ static struct lwkt_thread *lwkt_create_locked(const char *name, void (*entry)(vo
     if (bind_u) {
         t->uthread = bind_u;
         bind_u->lwkt = t;
-        bind_u->uthread_id = t->id;
+        /* Keep alloc_uthread_id() — do not alias TID to LWKT id (join races). */
         bind_u->state = UTHREAD_RUNNABLE;
     } else {
         t->uthread = NULL;
@@ -754,7 +812,7 @@ struct lwkt_thread *lwkt_create(const char *name, void (*entry)(void *), void *a
         return NULL;
     }
 
-    lwkt_sched_ipi_others();
+    lwkt_sched_ipi_thread(t);
     return t;
 }
 
@@ -778,7 +836,7 @@ struct lwkt_thread *lwkt_create_user(const char *name, void (*entry)(void *), vo
         return NULL;
     }
 
-    lwkt_sched_ipi_others();
+    lwkt_sched_ipi_thread(t);
     return t;
 }
 
@@ -788,8 +846,6 @@ int lwkt_destroy(uint32_t id) {
     }
 
     int wake_blocked = 0;
-    int remote_running = 0;
-    int self_current = 0;
     int owner_cpu = -1;
 
     uint64_t irqf;
@@ -802,20 +858,15 @@ int lwkt_destroy(uint32_t id) {
 
     enum thread_state old = t->state;
     owner_cpu = thread_owner_cpu_id(t);
-    self_current = owner_cpu >= 0 &&
-                   this_cpu() &&
-                   owner_cpu == (int)this_cpu()->id;
+    int self_current = owner_cpu >= 0 &&
+                       this_cpu() &&
+                       owner_cpu == (int)this_cpu()->id;
 
     if (owner_cpu >= 0 && !self_current) {
-        /*
-         * Remote current thread: request cooperative termination on owner CPU.
-         * Do not clear ID/stack here.
-         */
         t->pending_kill = 1;
         t->entry_point = NULL;
-        remote_running = 1;
         sched_unlock_irqrestore(irqf);
-        lwkt_sched_ipi_others();
+        lwkt_sched_ipi_cpu(cpu_by_id((uint32_t)owner_cpu));
         return 0;
     }
 
@@ -847,9 +898,7 @@ int lwkt_destroy(uint32_t id) {
 
     if (wake_blocked) {
         msgport_wakeup(t);
-        lwkt_sched_ipi_others();
-    } else if (remote_running) {
-        lwkt_sched_ipi_others();
+        lwkt_sched_ipi_thread(t);
     }
     return 0;
 }
@@ -977,6 +1026,8 @@ void lwkt_list(void) {
     console_writestring(" threads (incl. idle per CPU)\n");
     console_writestring("IPC bump mode=");
     console_write_dec((uint64_t)ipc_bump_enabled);
+    console_writestring(" attempts=");
+    console_write_dec(ipc_bump_attempts);
     console_writestring(" applied=");
     console_write_dec(ipc_bump_applied);
     console_writestring(" debounce_skip=");
@@ -984,29 +1035,57 @@ void lwkt_list(void) {
     console_writestring(" disabled_skip=");
     console_write_dec(ipc_bump_skipped_disabled);
     console_putchar('\n');
+    console_writestring("IPI targeted=");
+    console_write_dec(ipi_targeted);
+    console_writestring(" local=");
+    console_write_dec(ipi_local);
+    console_writestring(" broadcast=");
+    console_write_dec(ipi_broadcast);
+    console_putchar('\n');
 }
 
 void lwkt_smp_balance(void) {
-    console_writestring("\nSMP balance (KSE user uthreads per LWKT):\n");
-    console_writestring("CPU  Switches   Current          Runners(run/rdy)  LWKT-ready\n");
-    console_writestring("---  ---------  ---------------  ----------------  ----------\n");
-
+    struct {
+        uint32_t id;
+        uint64_t switches;
+        uint64_t steals;
+        uint64_t pulls;
+        unsigned runners_run;
+        unsigned runners_ready;
+        unsigned lwkt_ready;
+        char tname[16];
+    } snap[MAX_CPUS];
+    uint32_t n = 0;
     uint64_t irqf;
-    sched_lock_irqsave(&irqf);
 
-    for (uint32_t i = 0; i < cpu_online_count(); i++) {
+    console_writestring("\nSMP balance (KSE user uthreads per LWKT):\n");
+    console_writestring("CPU  Switches  Steals  Pulls  Current          Runners(run/rdy)  LWKT-ready\n");
+    console_writestring("---  ---------  ------  -----  ---------------  ----------------  ----------\n");
+
+    sched_lock_irqsave(&irqf);
+    for (uint32_t i = 0; i < cpu_online_count() && n < MAX_CPUS; i++) {
         struct cpu *c = cpu_by_id(i);
         if (!c || !c->online) {
             continue;
         }
 
-        unsigned runners_run = 0;
-        unsigned runners_ready = 0;
-        unsigned lwkt_ready = 0;
+        snap[n].id = c->id;
+        snap[n].switches = c->switches;
+        snap[n].steals = c->steals;
+        snap[n].pulls = c->same_proc_pulls;
+        snap[n].runners_run = 0;
+        snap[n].runners_ready = 0;
+        snap[n].lwkt_ready = 0;
 
         struct lwkt_thread *tcur = c->current;
         if (tcur && tcur != &c->idle && tcur->user_proc) {
-            runners_run = 1;
+            snap[n].runners_run = 1;
+        }
+        if (tcur) {
+            strcpy_local(snap[n].tname, tcur->name);
+        } else {
+            snap[n].tname[0] = '-';
+            snap[n].tname[1] = '\0';
         }
 
         for (uint32_t p = 0; p < MAX_PRIORITY; p++) {
@@ -1014,29 +1093,42 @@ void lwkt_smp_balance(void) {
                 if (t == &c->idle || t->state != THREAD_READY) {
                     continue;
                 }
-                lwkt_ready++;
+                snap[n].lwkt_ready++;
                 if (t->user_proc) {
-                    runners_ready++;
+                    snap[n].runners_ready++;
                 }
             }
         }
+        n++;
+    }
+    sched_unlock_irqrestore(irqf);
 
-        write_u64_padded((uint64_t)c->id, 3);
+    for (uint32_t i = 0; i < n; i++) {
+        write_u64_padded((uint64_t)snap[i].id, 3);
         console_writestring("  ");
-        write_u64_padded(c->switches, 9);
+        write_u64_padded(snap[i].switches, 9);
         console_writestring("  ");
-        write_padded(tcur ? tcur->name : "-", 15);
+        write_u64_padded(snap[i].steals, 6);
         console_writestring("  ");
-        write_ratio_padded((uint64_t)runners_run, (uint64_t)runners_ready, 16);
+        write_u64_padded(snap[i].pulls, 5);
         console_writestring("  ");
-        write_u64_padded((uint64_t)lwkt_ready, 10);
+        write_padded(snap[i].tname, 15);
+        console_writestring("  ");
+        write_ratio_padded((uint64_t)snap[i].runners_run, (uint64_t)snap[i].runners_ready, 16);
+        console_writestring("  ");
+        write_u64_padded((uint64_t)snap[i].lwkt_ready, 10);
         console_putchar('\n');
     }
 
-    sched_unlock_irqrestore(irqf);
-
+    console_writestring("IPI targeted=");
+    console_write_dec(ipi_targeted);
+    console_writestring(" local=");
+    console_write_dec(ipi_local);
+    console_writestring(" broadcast=");
+    console_write_dec(ipi_broadcast);
+    console_putchar('\n');
     console_writestring(
-        "\nNote: each user uthread is a schedulable LWKT (KSE); "
+        "Note: each user uthread is a schedulable LWKT (KSE); "
         "more CPUs help parallel uthreads across processes.\n");
 }
 
@@ -1078,15 +1170,12 @@ static int sched_has_ready_other(struct lwkt_thread *skip) {
 void lwkt_syscall_wait_edge(void) {
     /*
      * int 0x80 uses syscall_stack — not safe to lwkt_switch() here.
-     * KSE user threads with an active runner_setjmp longjmp back and
-     * lwkt_yield() when other LWKTs are runnable (SMP=1 shell READ).
+     * Prefer returning when UART has data (no COM1 IRQ). Do not longjmp
+     * out of blocking SYS_READ: that caused yield storms and lost serial
+     * input under SMP after repeated exec.
      */
-    struct lwkt_thread *cur = lwkt_curthread();
-    if (cur && cur->uthread && cur->uthread->type == UTHREAD_USER &&
-        cur->runner_jmp.rsp != 0 && sched_has_ready_other(cur)) {
-        cur->runner_reswitch = 1;
-        cur->in_syscall = 0;
-        runner_longjmp(&cur->runner_jmp, 1);
+    if (serial_has_char()) {
+        return;
     }
     __asm__ volatile("sti; hlt" ::: "memory");
 }
@@ -1392,11 +1481,13 @@ void lwkt_unblock(struct lwkt_thread *t) {
         return;
     }
     uint64_t irqf;
+    struct cpu *dest;
     sched_lock_irqsave(&irqf);
     t->state = THREAD_READY;
     enqueue_thread(t);
+    dest = cpu_by_id(t->run_cpu);
     sched_unlock_irqrestore(irqf);
-    lwkt_sched_ipi_others();
+    lwkt_sched_ipi_cpu(dest);
 }
 
 void lwkt_nudge(struct lwkt_thread *t) {
@@ -1405,22 +1496,26 @@ void lwkt_nudge(struct lwkt_thread *t) {
     }
 
     uint64_t irqf;
+    struct cpu *dest = NULL;
     sched_lock_irqsave(&irqf);
     if (t->state == THREAD_BLOCKED) {
         t->state = THREAD_READY;
         enqueue_thread(t);
+        dest = cpu_by_id(t->run_cpu);
     } else if (t->state == THREAD_READY) {
         remove_from_queues(t);
-        struct cpu *c = cpu_by_id(t->run_cpu);
-        if (!c || !c->online) {
-            c = this_cpu();
+        dest = cpu_by_id(t->run_cpu);
+        if (!dest || !dest->online) {
+            dest = this_cpu();
         }
-        if (c) {
-            enqueue_on_cpu_head(c, t);
+        if (dest) {
+            enqueue_on_cpu_head(dest, t);
         }
+    } else {
+        dest = cpu_for_thread_wake(t);
     }
     sched_unlock_irqrestore(irqf);
-    lwkt_sched_ipi_others();
+    lwkt_sched_ipi_cpu(dest);
 }
 
 void lwkt_thread_exit(void) {

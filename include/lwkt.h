@@ -77,10 +77,14 @@ static inline uint64_t lwkt_thread_syscall_rsp0(struct lwkt_thread *t) {
     return ((uint64_t)(uintptr_t)t->syscall_stack + SYSCALL_STACK_SIZE) & ~0xFULL;
 }
 
+struct cpu;
+
 void lwkt_init(void);
 void lwkt_sched_start(void);
 void lwkt_sched_stop(void);
 void lwkt_sched_enable(void);
+void lwkt_sched_ipi_cpu(struct cpu *dest);
+void lwkt_sched_ipi_thread(struct lwkt_thread *t);
 void lwkt_sched_ipi_others(void);
 
 struct lwkt_thread *lwkt_create(const char *name, void (*entry)(void *), void *arg, uint32_t priority);

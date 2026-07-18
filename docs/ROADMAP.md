@@ -13,16 +13,30 @@
 |------|-------|
 | `run_queues[]` глобально | `struct cpu.run_queues[MAX_PRIORITY]` |
 | Любой CPU берёт любой поток | CPU сначала local, затем **work steal** |
-| `sched_lock` на всё | `sched_lock` пока общий (фаза 1b — per-CPU lock опционально) |
+| `sched_lock` на всё | per-CPU queues + steal; `sched_lock` пока глобальный |
 
 **Файлы:** `include/cpu.h`, `kernel/sched/lwkt.c`, `kernel/arch/x86_64/smp.c`, `docs/SMP.md`
 
 **Проверка:**
 ```text
-cpus          # switches растут на обоих CPU
+cpus          # switches растут на обоих CPU; Steals/Pulls/IPI-rx
 exec threads.elf
-cpus
+smpbalance    # IPI targeted >> broadcast
 ```
+
+---
+
+## Фаза 1b — Targeted IPI + fairness metrics ✅
+
+**Цель:** точечный wake и телеметрия; per-CPU `queue_lock` отложен (гонки на SMP=8).
+
+| Было | Стало |
+|------|-------|
+| Broadcast IPI после enqueue | `lwkt_sched_ipi_cpu(run_cpu)` / local preempt |
+| Мало телеметрии | Steals/Pulls/IPI в `cpus`/`smpbalance`/`threads` |
+| `sched_lock` глобальный | остаётся (per-CPU locks — следующий шаг) |
+
+**Проверка:** `help` → `ping` → `exec threads.elf` → `uthreads` → `smpbalance` → `cpus`
 
 ---
 

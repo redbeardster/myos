@@ -56,6 +56,7 @@ int proc_is_shell(struct proc *p);
 void proc_attach_uthread(struct proc *p, struct uthread *u);
 void proc_detach_uthread(struct proc *p, struct uthread *u);
 void proc_on_uthread_exit(struct proc *p, struct uthread *u);
+void proc_shell_serial_kick(void);
 int proc_start_runner(struct proc *p, uint32_t lwkt_priority);
 void proc_runner_resched(struct proc *p);
 void proc_sched_nudge(struct proc *p);

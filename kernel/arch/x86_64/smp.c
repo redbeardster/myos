@@ -95,6 +95,9 @@ static struct cpu *cpu_alloc(uint32_t lapic_id, int bsp) {
     c->sched_active = 0;
     c->bootstrap_rsp = 0;
     c->switches = 0;
+    c->steals = 0;
+    c->same_proc_pulls = 0;
+    c->ipi_rx = 0;
     for (int i = 0; i < MAX_PRIORITY; i++) {
         c->run_queues[i] = NULL;
     }
@@ -255,7 +258,10 @@ void cpu_list(void) {
     struct {
         uint32_t id;
         uint32_t lapic_id;
-        uint32_t switches;
+        uint64_t switches;
+        uint64_t steals;
+        uint64_t same_proc_pulls;
+        uint64_t ipi_rx;
         int bsp;
         int sched_active;
         int has_current;
@@ -271,6 +277,9 @@ void cpu_list(void) {
         snap[i].id = c->id;
         snap[i].lapic_id = c->lapic_id;
         snap[i].switches = c->switches;
+        snap[i].steals = c->steals;
+        snap[i].same_proc_pulls = c->same_proc_pulls;
+        snap[i].ipi_rx = c->ipi_rx;
         snap[i].bsp = c->bsp;
         snap[i].sched_active = c->sched_active;
         if (c->current) {
@@ -285,8 +294,8 @@ void cpu_list(void) {
     }
     spin_unlock(&cpu_list_lock);
 
-    console_writestring("\nCPU  Lapic  BSP  Sched  Switches    Current thread\n");
-    console_writestring("---  -----  ---  -----  ---------   -------------------------\n");
+    console_writestring("\nCPU  Lapic  BSP  Sched  Switches  Steals  Pulls  IPI-rx  Current thread\n");
+    console_writestring("---  -----  ---  -----  ---------  ------  -----  ------  -------------------------\n");
 
     for (uint32_t i = 0; i < ncpu; i++) {
         write_u64_padded((uint64_t)snap[i].id, 3);
@@ -297,8 +306,14 @@ void cpu_list(void) {
         console_writestring("  ");
         write_padded(snap[i].sched_active ? "on" : "off", 5);
         console_writestring("  ");
-        write_u64_padded((uint64_t)snap[i].switches, 9);
-        console_writestring("   ");
+        write_u64_padded(snap[i].switches, 9);
+        console_writestring("  ");
+        write_u64_padded(snap[i].steals, 6);
+        console_writestring("  ");
+        write_u64_padded(snap[i].same_proc_pulls, 5);
+        console_writestring("  ");
+        write_u64_padded(snap[i].ipi_rx, 6);
+        console_writestring("  ");
 
         if (snap[i].has_current) {
             write_padded(snap[i].tname, 10);

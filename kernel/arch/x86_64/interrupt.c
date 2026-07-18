@@ -201,6 +201,10 @@ void timer_interrupt_handler(void) {
     timer_ticks++;
     timer_switch_count++;
     lwkt_timer_tick();
+    /* Only BSP polls UART — avoids 8-way proc_table_lock storms on SMP. */
+    if (cpu_current() && cpu_current()->bsp) {
+        proc_shell_serial_kick();
+    }
     lwkt_preempt_request();
 }
 
@@ -224,6 +228,9 @@ void interrupt_handler(uint64_t int_no, uint64_t err_code, uint64_t rip, uint64_
         timer_ticks++;
         timer_switch_count++;
         lwkt_timer_tick();
+        if (cpu_current() && cpu_current()->bsp) {
+            proc_shell_serial_kick();
+        }
         lwkt_preempt_request();
         lapic_eoi();
         if (!lwkt_in_usersyscall()) {
@@ -233,6 +240,10 @@ void interrupt_handler(uint64_t int_no, uint64_t err_code, uint64_t rip, uint64_
     }
 
     if (int_no == LAPIC_IPI_RESCHED_VECTOR) {
+        struct cpu *cpu = cpu_current();
+        if (cpu) {
+            cpu->ipi_rx++;
+        }
         lwkt_preempt_request();
         lapic_eoi();
         if (!lwkt_in_usersyscall()) {

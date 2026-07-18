@@ -370,7 +370,7 @@ if (t && t->uthread && t->uthread->type == UTHREAD_USER) {
 - Новые блокирующие syscall — по образцу `SYS_READ` / proc-runner ([PROC_RUNNER.md](PROC_RUNNER.md) §4).
 - Любое копирование из user VA — с активным CR3 **того процесса**, который вызвал syscall
   (`proc_current()->cr3` уже выбран через `lwkt_apply_cr3`).
-- Для SMP: см. [SMP.md](SMP.md) — AP boot, per-CPU TSS/GS, LAPIC timer, `sched_lock`.
+- Для SMP: см. [SMP.md](SMP.md) — AP boot, per-CPU TSS/GS, LAPIC timer, `queue_lock` / targeted IPI.
 - Mutex proc: `proc_mutex.c`, до `MYOS_PROC_MUTEX_MAX` слотов, wait queue через `lwkt_thread.wait_next`.
 
 ---

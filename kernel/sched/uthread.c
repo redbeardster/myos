@@ -57,6 +57,14 @@ static int join_take_and_reap(uint32_t uthread_id, int *exit_code_out) {
     }
     struct uthread *u = find_by_id(uthread_id);
     if (u) {
+        struct proc *joiner = proc_current();
+        if (u->proc && joiner && u->proc != joiner) {
+            /* Exit code is valid, but do not tear down another process's uthread. */
+            return 1;
+        }
+        if (u->proc && proc_is_shell(u->proc)) {
+            return 1;
+        }
         if (u->proc) {
             proc_detach_uthread(u->proc, u);
         }

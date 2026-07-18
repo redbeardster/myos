@@ -276,28 +276,67 @@ void proc_detach_uthread(struct proc *p, struct uthread *u) {
     spin_unlock_irqrestore(&proc_table_lock, irqf);
 }
 
+static struct proc *proc_find_shell_locked(void) {
+    for (int i = 0; i < MAX_PROCS; i++) {
+        struct proc *s = &proc_table[i];
+        if (s->pid != 0 && s->is_shell) {
+            return s;
+        }
+    }
+    return NULL;
+}
+
 static void proc_wake_shell(void) {
     uint64_t irqf;
-    struct proc *shell_proc = NULL;
+    struct proc *shell_proc;
     struct lwkt_thread *shell_lwkt = NULL;
 
     spin_lock_irqsave(&proc_table_lock, &irqf);
-    for (int i = 0; i < MAX_PROCS; i++) {
-        struct proc *s = &proc_table[i];
-        if (s->pid != 0 && s->is_shell && s->main_thread && s->main_thread->lwkt) {
-            shell_proc = s;
-            shell_lwkt = s->main_thread->lwkt;
-            break;
+    shell_proc = proc_find_shell_locked();
+    if (shell_proc) {
+        shell_proc->read_wake = 1;
+        if (shell_proc->main_thread && shell_proc->main_thread->lwkt) {
+            shell_lwkt = shell_proc->main_thread->lwkt;
+        } else if (shell_proc->current_uthread && shell_proc->current_uthread->lwkt) {
+            shell_lwkt = shell_proc->current_uthread->lwkt;
+        } else if (shell_proc->runner) {
+            shell_lwkt = shell_proc->runner;
         }
     }
     spin_unlock_irqrestore(&proc_table_lock, irqf);
 
+    if (!shell_proc) {
+        return;
+    }
+
+    console_writestring("\nMyOS> ");
+    if (shell_lwkt) {
+        lwkt_nudge(shell_lwkt);
+    }
+    lwkt_sched_ipi_others();
+}
+
+/*
+ * UART has no IRQ in this port; drain depends on the shell polling. Kick the
+ * shell when COM1 has bytes so FIFO overflow during busy SMP work is rarer.
+ */
+void proc_shell_serial_kick(void) {
+    if (!serial_has_char()) {
+        return;
+    }
+
+    uint64_t irqf;
+    struct proc *shell_proc;
+
+    spin_lock_irqsave(&proc_table_lock, &irqf);
+    shell_proc = proc_find_shell_locked();
     if (shell_proc) {
         shell_proc->read_wake = 1;
     }
-    if (shell_lwkt) {
-        lwkt_nudge(shell_lwkt);
-        console_writestring("\nMyOS> ");
+    spin_unlock_irqrestore(&proc_table_lock, irqf);
+
+    if (shell_proc) {
+        lwkt_preempt_request();
         lwkt_sched_ipi_others();
     }
 }
@@ -349,19 +388,24 @@ static void proc_destroy_aspace(uint64_t cr3) {
     vmm_aspace_destroy(cr3);
 }
 
-static void proc_request_kill_locked(struct proc *p) {
+static void proc_request_kill_locked(struct proc *p,
+                                     struct lwkt_thread **wake_list,
+                                     int *wake_count,
+                                     int wake_max) {
     for (struct uthread *u = p->threads; u; u = u->next_in_proc) {
         if (u->lwkt && u->lwkt->id) {
             u->lwkt->pending_kill = 1;
-            if (u->lwkt->state == THREAD_BLOCKED) {
-                lwkt_unblock(u->lwkt);
+            if (u->lwkt->state == THREAD_BLOCKED && wake_list && wake_count &&
+                *wake_count < wake_max) {
+                wake_list[(*wake_count)++] = u->lwkt;
             }
         }
     }
     if (p->runner && p->runner->id) {
         p->runner->pending_kill = 1;
-        if (p->runner->state == THREAD_BLOCKED) {
-            lwkt_unblock(p->runner);
+        if (p->runner->state == THREAD_BLOCKED && wake_list && wake_count &&
+            *wake_count < wake_max) {
+            wake_list[(*wake_count)++] = p->runner;
         }
     }
 }
@@ -370,16 +414,25 @@ void proc_destroy(struct proc *p) {
     if (!p || p->pid == 0) {
         return;
     }
+    if (p->is_shell) {
+        return;
+    }
 
     uint64_t irqf;
+    struct lwkt_thread *wake_list[8];
+    int wake_count = 0;
+
     spin_lock_irqsave(&proc_table_lock, &irqf);
 
     struct lwkt_thread *cur = lwkt_curthread();
     int on_proc_lwkt = cur && cur->user_proc == p;
 
     if (!on_proc_lwkt && (p->uthread_count > 0 || p->runner)) {
-        proc_request_kill_locked(p);
+        proc_request_kill_locked(p, wake_list, &wake_count, 8);
         spin_unlock_irqrestore(&proc_table_lock, irqf);
+        for (int i = 0; i < wake_count; i++) {
+            lwkt_unblock(wake_list[i]);
+        }
         lwkt_sched_ipi_others();
         return;
     }
@@ -390,8 +443,12 @@ void proc_destroy(struct proc *p) {
     }
 
     if (p->runner && cur != p->runner) {
-        proc_request_kill_locked(p);
+        wake_count = 0;
+        proc_request_kill_locked(p, wake_list, &wake_count, 8);
         spin_unlock_irqrestore(&proc_table_lock, irqf);
+        for (int i = 0; i < wake_count; i++) {
+            lwkt_unblock(wake_list[i]);
+        }
         lwkt_sched_ipi_others();
         return;
     }
@@ -400,14 +457,18 @@ void proc_destroy(struct proc *p) {
         p->runner = NULL;
     }
 
+    uint64_t cr3 = 0;
     if (p->cr3) {
-        uint64_t cr3 = p->cr3;
+        cr3 = p->cr3;
         p->cr3 = 0;
-        proc_destroy_aspace(cr3);
     }
 
     proc_reset_slot(p);
     spin_unlock_irqrestore(&proc_table_lock, irqf);
+
+    if (cr3) {
+        proc_destroy_aspace(cr3);
+    }
 }
 
 void proc_kill_children(void) {

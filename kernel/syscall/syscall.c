@@ -145,8 +145,9 @@ static int sys_read(uint64_t fd) {
 
             struct proc *p = proc_current();
             if (p && p->read_wake) {
+                /* Wake hint only — stay in kernel and re-poll / hlt. */
                 p->read_wake = 0;
-                return MYOS_ERR_AGAIN;
+                continue;
             }
 
             struct uthread *u = uthread_current();

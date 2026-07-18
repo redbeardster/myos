@@ -67,7 +67,7 @@ contention, hold time в драйверах, priority inversion, «IRQ + spinloc
 
 **MyOS сейчас** — осознанный гибрид:
 
-- spinlock остаётся на **горячих** путях (`sched_lock`, `page_lock`);
+- spinlock остаётся на **горячих** путях (`queue_lock` / `thread_pool_lock`, `page_lock`);
 - token — для **объектов** вроде mailbox, позже VFS/буферы;
 - не заменяем всё ядро tokens за один шаг.
 
