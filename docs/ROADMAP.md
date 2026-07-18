@@ -13,7 +13,7 @@
 |------|-------|
 | `run_queues[]` глобально | `struct cpu.run_queues[MAX_PRIORITY]` |
 | Любой CPU берёт любой поток | CPU сначала local, затем **work steal** |
-| `sched_lock` на всё | per-CPU queues + steal; `sched_lock` пока глобальный |
+| `sched_lock` на всё | per-CPU queues + steal; позже per-CPU `queue_lock` (фаза 1c) |
 
 **Файлы:** `include/cpu.h`, `kernel/sched/lwkt.c`, `kernel/arch/x86_64/smp.c`, `docs/SMP.md`
 
@@ -28,15 +28,28 @@ smpbalance    # IPI targeted >> broadcast
 
 ## Фаза 1b — Targeted IPI + fairness metrics ✅
 
-**Цель:** точечный wake и телеметрия; per-CPU `queue_lock` отложен (гонки на SMP=8).
+**Цель:** точечный wake и телеметрия.
 
 | Было | Стало |
 |------|-------|
 | Broadcast IPI после enqueue | `lwkt_sched_ipi_cpu(run_cpu)` / local preempt |
 | Мало телеметрии | Steals/Pulls/IPI в `cpus`/`smpbalance`/`threads` |
-| `sched_lock` глобальный | остаётся (per-CPU locks — следующий шаг) |
 
 **Проверка:** `help` → `ping` → `exec threads.elf` → `uthreads` → `smpbalance` → `cpus`
+
+---
+
+## Фаза 1c — Per-CPU `queue_lock` ✅
+
+**Цель:** убрать глобальный `sched_lock` с hot path.
+
+| Было | Стало |
+|------|-------|
+| один `sched_lock` | `cpu->queue_lock` + `thread_pool_lock` |
+| steal под одним lock | `queue_lock_two` по `cpu->id`; pin yielder; claim `RUNNING` |
+| idle в run queue | idle не enqueue; foreign steal пропускает idle/pinned |
+
+**Проверка:** `qemu_kse_test.exp`; ≥20× `threads.elf` на `-smp 8`; `smpbalance` (Steals/Pulls, IPI).
 
 ---
 

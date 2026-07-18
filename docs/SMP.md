@@ -1,7 +1,7 @@
 # MyOS — SMP (Symmetric Multiprocessing)
 
 Этап 2: запуск Application Processors (AP) через Limine, per-CPU состояние,
-per-CPU run queues, глобальный `sched_lock`, LAPIC timer и targeted IPI.
+per-CPU run queues и `queue_lock`, `thread_pool_lock`, LAPIC timer и targeted IPI.
 
 ---
 
@@ -9,24 +9,24 @@ per-CPU run queues, глобальный `sched_lock`, LAPIC timer и targeted I
 
 ```
               ┌──────────────────────────────────────┐
-              │  sched_lock (глобальный, irqsave)     │
-              └──────────────────┬───────────────────┘
-                                 │
-      ┌──────────────────────────┼──────────────────────────┐
+              │  thread_pool_lock (create/destroy)   │
+              └──────────────────────────────────────┘
+      ┌──────────────────────────┬──────────────────────────┐
       ▼                          ▼                          ▼
 ┌───────────┐            ┌───────────┐            ┌───────────┐
 │ CPU 0 BSP │            │ CPU 1 AP  │            │ CPU N AP  │
+│ queue_lock│            │ queue_lock│            │ queue_lock│
 │ run_queues│            │ run_queues│            │ run_queues│
 │ idle/cur  │            │ idle/cur  │            │ idle/cur  │
 │ work steal│◄──────────►│ work steal│            │           │
 └───────────┘            └───────────┘            └───────────┘
 ```
 
-- **Per-CPU** `run_queues[MAX_PRIORITY]` в `struct cpu` (очередь локальная).
-- Поток ставится через `pick_enqueue_cpu` / `enqueue_on_cpu`.
-- Пустой CPU **крадёт** работу с другого CPU (`dequeue_thread`).
-- Синхронизация очередей: пока **глобальный** `sched_lock` (per-CPU `queue_lock` отложен — гонки на SMP=8).
-- Wake: **targeted IPI** на `run_cpu` / owner (`lwkt_sched_ipi_cpu` / `lwkt_sched_ipi_thread`); broadcast — fallback.
+- **Per-CPU** `run_queues[MAX_PRIORITY]` и `queue_lock` в `struct cpu`.
+- `thread_pool_lock` — только alloc/free слотов LWKT (никогда после `queue_lock`).
+- Steal: `queue_lock_two` по возрастанию `cpu->id`; idle не ставится в очередь; yielder `queue_pinned` до локального dequeue; claim `RUNNING` до unlock (гонка с `lwkt_nudge`).
+- С busy CPU крадём только при ≥2 stealable waiters; с idle — при любом backlog.
+- Wake: enqueue под lock dest, затем **вне** lock — `lwkt_sched_ipi_cpu(dest)`.
 
 Дорожная карта: [ROADMAP.md](ROADMAP.md).
 
@@ -64,7 +64,7 @@ SMP: all CPUs online (2 total)
 - per-CPU: `steals`, `same_proc_pulls`, `ipi_rx`
 - глобально: `ipi_targeted`, `ipi_local`, `ipi_broadcast`
 
-Ожидание на горячем пути: **targeted ≫ broadcast**.
+Ожидание на горячем пути: **targeted ≫ broadcast** (broadcast на join/kill пока допустим).
 
 ---
 
@@ -82,10 +82,11 @@ smpbalance
 cpus
 ```
 
-Автотест: `expect tools/qemu_kse_test.exp`
+Автотест: `expect tools/qemu_kse_test.exp`  
+Регрессия: ≥20× `exec threads.elf` подряд на `-smp 8` без hang.
 
 ---
 
 ## 5. Следующий шаг
 
-Per-CPU `queue_lock` + `thread_pool_lock` (без глобального `sched_lock`) — только после стабильного steal/idle-wake протокола на SMP=8.
+Сузить broadcast на kill/join (больше targeted wakes). UART IRQ вместо serial poll в `wait_edge`.

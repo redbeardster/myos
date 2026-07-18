@@ -18,7 +18,7 @@ extern void switch_context(uint64_t *old_rsp, uint64_t new_rsp);
 extern void thread_bootstrap(void);
 
 static struct lwkt_thread thread_pool[MAX_THREADS];
-static spinlock_t sched_lock;
+static spinlock_t thread_pool_lock;
 static int thread_count;
 static uint32_t next_id = 1;
 static int sched_active;
@@ -34,6 +34,28 @@ static uint64_t ipi_broadcast;
 static struct cpu *this_cpu(void);
 static void strcpy_local(char *dst, const char *src);
 static int thread_owner_cpu_id(struct lwkt_thread *t);
+
+/* Per-CPU idle must never sit on a run queue (steal would migrate it). */
+static int is_idle_thread(const struct lwkt_thread *t) {
+    if (!t) {
+        return 0;
+    }
+    for (uint32_t i = 0; i < cpu_online_count(); i++) {
+        struct cpu *c = cpu_by_id(i);
+        if (c && t == &c->idle) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Foreign steal/pull: READY only, not idle, not mid-switch (pinned or still current). */
+static int stealable_foreign(struct lwkt_thread *t) {
+    if (!t || t->state != THREAD_READY || t->queue_pinned || is_idle_thread(t)) {
+        return 0;
+    }
+    return thread_owner_cpu_id(t) < 0;
+}
 
 static struct cpu *cpu_for_thread_wake(struct lwkt_thread *t) {
     int owner = thread_owner_cpu_id(t);
@@ -59,8 +81,64 @@ static void cpu_run_queues_init(struct cpu *cpu) {
     }
 }
 
+static void queue_lock(struct cpu *c) {
+    if (c) {
+        spin_lock(&c->queue_lock);
+    }
+}
+
+static void queue_unlock(struct cpu *c) {
+    if (c) {
+        spin_unlock(&c->queue_lock);
+    }
+}
+
+static void queue_lock_two(struct cpu *a, struct cpu *b) {
+    if (!a) {
+        queue_lock(b);
+        return;
+    }
+    if (!b || a == b) {
+        queue_lock(a);
+        return;
+    }
+    if (a->id < b->id) {
+        queue_lock(a);
+        queue_lock(b);
+    } else {
+        queue_lock(b);
+        queue_lock(a);
+    }
+}
+
+static void queue_unlock_two(struct cpu *a, struct cpu *b) {
+    if (!a) {
+        queue_unlock(b);
+        return;
+    }
+    if (!b || a == b) {
+        queue_unlock(a);
+        return;
+    }
+    if (a->id < b->id) {
+        queue_unlock(b);
+        queue_unlock(a);
+    } else {
+        queue_unlock(a);
+        queue_unlock(b);
+    }
+}
+
+static void pool_lock_irqsave(uint64_t *irqf) {
+    spin_lock_irqsave(&thread_pool_lock, irqf);
+}
+
+static void pool_unlock_irqrestore(uint64_t irqf) {
+    spin_unlock_irqrestore(&thread_pool_lock, irqf);
+}
+
 static void enqueue_on_cpu(struct cpu *cpu, struct lwkt_thread *t) {
-    if (!cpu || !t || t->state == THREAD_TERMINATED) {
+    if (!cpu || !t || t->state == THREAD_TERMINATED || is_idle_thread(t)) {
         return;
     }
 
@@ -76,7 +154,7 @@ static void enqueue_on_cpu(struct cpu *cpu, struct lwkt_thread *t) {
 }
 
 static void enqueue_on_cpu_head(struct cpu *cpu, struct lwkt_thread *t) {
-    if (!cpu || !t || t->state == THREAD_TERMINATED) {
+    if (!cpu || !t || t->state == THREAD_TERMINATED || is_idle_thread(t)) {
         return;
     }
 
@@ -110,13 +188,19 @@ static struct cpu *pick_enqueue_cpu(struct uthread *bind_u) {
     return cpu;
 }
 
-static void enqueue_thread(struct lwkt_thread *t) {
+/* Returns destination CPU after enqueue (locks released). IRQs safe. */
+static struct cpu *enqueue_thread(struct lwkt_thread *t) {
     struct uthread *bind_u = t ? t->uthread : NULL;
     struct cpu *cpu = pick_enqueue_cpu(bind_u);
     if (!cpu) {
         cpu = cpu_by_id(0);
     }
+    uint64_t irqf = cpu_irq_save();
+    queue_lock(cpu);
     enqueue_on_cpu(cpu, t);
+    queue_unlock(cpu);
+    cpu_irq_restore(irqf);
+    return cpu;
 }
 
 static int remove_from_cpu_queues(struct cpu *cpu, struct lwkt_thread *t) {
@@ -137,32 +221,62 @@ static int remove_from_cpu_queues(struct cpu *cpu, struct lwkt_thread *t) {
     return 0;
 }
 
+/* IRQs safe. */
 static int remove_from_queues(struct lwkt_thread *t) {
-    int removed = 0;
+    if (!t) {
+        return 0;
+    }
+
+    uint64_t irqf = cpu_irq_save();
+    struct cpu *prefer = cpu_by_id(t->run_cpu);
+    if (prefer && prefer->online) {
+        queue_lock(prefer);
+        if (remove_from_cpu_queues(prefer, t)) {
+            queue_unlock(prefer);
+            cpu_irq_restore(irqf);
+            return 1;
+        }
+        queue_unlock(prefer);
+    }
+
     for (uint32_t i = 0; i < cpu_online_count(); i++) {
         struct cpu *c = cpu_by_id(i);
-        if (c && c->online) {
-            removed |= remove_from_cpu_queues(c, t);
+        if (!c || !c->online || c == prefer) {
+            continue;
         }
+        queue_lock(c);
+        if (remove_from_cpu_queues(c, t)) {
+            queue_unlock(c);
+            cpu_irq_restore(irqf);
+            return 1;
+        }
+        queue_unlock(c);
     }
-    return removed;
+    cpu_irq_restore(irqf);
+    return 0;
 }
 
 /*
  * Dequeue one runnable thread from cpu's local queues.
- * Returns NULL if empty (or only skip matches with use_skip_fallback).
+ * Caller must hold cpu->queue_lock.
+ * foreign=1: only stealable_foreign threads (steal / same-proc pull).
  */
 static struct lwkt_thread *dequeue_from_cpu(struct cpu *cpu, struct lwkt_thread *skip,
-                                          int use_skip_fallback) {
+                                          int use_skip_fallback, int foreign) {
     struct lwkt_thread *fallback = NULL;
 
     for (uint32_t p = 0; p < MAX_PRIORITY; p++) {
         struct lwkt_thread **slot = &cpu->run_queues[p];
         while (*slot) {
             struct lwkt_thread *t = *slot;
-            if (t->state == THREAD_TERMINATED) {
+            if (t->state == THREAD_TERMINATED || is_idle_thread(t)) {
                 *slot = t->next;
                 t->next = NULL;
+                continue;
+            }
+
+            if (foreign && !stealable_foreign(t)) {
+                slot = &t->next;
                 continue;
             }
 
@@ -179,24 +293,42 @@ static struct lwkt_thread *dequeue_from_cpu(struct cpu *cpu, struct lwkt_thread 
     }
 
     if (use_skip_fallback && fallback) {
-        remove_from_queues(fallback);
+        remove_from_cpu_queues(cpu, fallback);
         return fallback;
     }
 
     return NULL;
 }
 
+/* Count foreign-stealable threads on cpu (caller holds queue_lock). */
+static int count_stealable_foreign(struct cpu *cpu) {
+    int n = 0;
+    for (uint32_t p = 0; p < MAX_PRIORITY; p++) {
+        for (struct lwkt_thread *t = cpu->run_queues[p]; t; t = t->next) {
+            if (stealable_foreign(t)) {
+                n++;
+            }
+        }
+    }
+    return n;
+}
+
+/* Acquires/releases queue locks; IRQs should already be off. */
 static struct lwkt_thread *dequeue_thread(struct cpu *cpu, struct lwkt_thread *skip) {
     int skip_fallback = 1;
     if (skip && skip->quantum_force) {
         skip_fallback = 0;
     }
 
-    struct lwkt_thread *t = dequeue_from_cpu(cpu, skip, 0);
+    queue_lock(cpu);
+    struct lwkt_thread *t = dequeue_from_cpu(cpu, skip, 0, 0);
     if (t) {
         if (skip && skip->quantum_force && t != skip) {
             skip->quantum_force = 0;
         }
+        /* Claim under lock: lwkt_nudge must not see READY and re-enqueue. */
+        t->state = THREAD_RUNNING;
+        queue_unlock(cpu);
         return t;
     }
 
@@ -207,46 +339,86 @@ static struct lwkt_thread *dequeue_thread(struct cpu *cpu, struct lwkt_thread *s
     /*
      * skip_fallback on a CPU that only has the yielding thread lets it spin
      * while sibling uthreads sit on other CPUs — pull same-proc peers first.
+     * Never hold one queue_lock then take another: unlock, then lock_two.
      */
     if (skip && skip->uthread && skip->uthread->proc) {
         struct proc *proc = skip->uthread->proc;
+        queue_unlock(cpu);
         for (uint32_t i = 0; i < cpu_online_count(); i++) {
             struct cpu *other = cpu_by_id(i);
             if (!other || !other->online || other == cpu) {
                 continue;
             }
-            t = dequeue_from_cpu(other, NULL, 0);
+            queue_lock_two(cpu, other);
+            /* Prefer any local arrival while unlocked. */
+            t = dequeue_from_cpu(cpu, skip, 0, 0);
+            if (t) {
+                t->state = THREAD_RUNNING;
+                queue_unlock_two(cpu, other);
+                return t;
+            }
+            t = dequeue_from_cpu(other, NULL, 0, 1);
             if (!t) {
+                queue_unlock_two(cpu, other);
                 continue;
             }
             if (t->uthread && t->uthread->proc == proc) {
                 t->run_cpu = cpu->id;
+                t->state = THREAD_RUNNING;
                 cpu->same_proc_pulls++;
+                queue_unlock_two(cpu, other);
                 return t;
             }
             enqueue_on_cpu(other, t);
+            queue_unlock_two(cpu, other);
         }
+        queue_lock(cpu);
     }
 
     if (skip_fallback) {
-        t = dequeue_from_cpu(cpu, skip, 1);
+        t = dequeue_from_cpu(cpu, skip, 1, 0);
         if (t) {
+            t->state = THREAD_RUNNING;
+            queue_unlock(cpu);
             return t;
         }
     }
+    queue_unlock(cpu);
 
-    /* Work steal: idle CPU pulls from another CPU's queue. */
+    /* Work steal: lock ids ascending via queue_lock_two. */
     for (uint32_t i = 0; i < cpu_online_count(); i++) {
         struct cpu *other = cpu_by_id(i);
         if (!other || !other->online || other == cpu) {
             continue;
         }
-        t = dequeue_from_cpu(other, NULL, 0);
+        queue_lock_two(cpu, other);
+        t = dequeue_from_cpu(cpu, skip, skip_fallback, 0);
         if (t) {
-            t->run_cpu = cpu->id;
-            cpu->steals++;
+            t->state = THREAD_RUNNING;
+            queue_unlock_two(cpu, other);
             return t;
         }
+        /*
+         * Steal from idle always; from busy only if ≥2 stealable waiters so we
+         * never take the sole queued peer of a mid-switch / running CPU.
+         */
+        {
+            int idle_victim = (other->current == &other->idle);
+            int n = count_stealable_foreign(other);
+            if (!idle_victim && n < 2) {
+                queue_unlock_two(cpu, other);
+                continue;
+            }
+        }
+        t = dequeue_from_cpu(other, NULL, 0, 1);
+        if (t) {
+            t->run_cpu = cpu->id;
+            t->state = THREAD_RUNNING;
+            cpu->steals++;
+            queue_unlock_two(cpu, other);
+            return t;
+        }
+        queue_unlock_two(cpu, other);
     }
 
     return &cpu->idle;
@@ -272,11 +444,17 @@ static int cpu_has_ready_peer(struct cpu *cpu) {
 }
 
 static int any_cpu_has_ready_user_runner(void) {
+    uint64_t irqf = cpu_irq_save();
     for (uint32_t i = 0; i < cpu_online_count(); i++) {
         struct cpu *c = cpu_by_id(i);
         if (!c || !c->online) {
             continue;
         }
+        if (!spin_trylock(&c->queue_lock)) {
+            cpu_irq_restore(irqf);
+            return 1;
+        }
+        int found = 0;
         for (uint32_t p = 0; p < MAX_PRIORITY; p++) {
             int guard = 0;
             for (struct lwkt_thread *t = c->run_queues[p]; t && guard < MAX_THREADS;
@@ -285,11 +463,21 @@ static int any_cpu_has_ready_user_runner(void) {
                     continue;
                 }
                 if (t->state == THREAD_READY) {
-                    return 1;
+                    found = 1;
+                    break;
                 }
             }
+            if (found) {
+                break;
+            }
+        }
+        spin_unlock(&c->queue_lock);
+        if (found) {
+            cpu_irq_restore(irqf);
+            return 1;
         }
     }
+    cpu_irq_restore(irqf);
     return 0;
 }
 
@@ -297,16 +485,18 @@ static int idle_should_yield(struct cpu *cpu) {
     if (!cpu) {
         return 0;
     }
-    /*
-     * Contended sched_lock often means another CPU is enqueueing for us —
-     * do not sleep; retry after a brief pause.
-     */
-    if (!spin_trylock(&sched_lock)) {
+    uint64_t irqf = cpu_irq_save();
+    if (!spin_trylock(&cpu->queue_lock)) {
+        cpu_irq_restore(irqf);
         return 1;
     }
-    int wake = cpu_has_ready_peer(cpu) || any_cpu_has_ready_user_runner();
-    spin_unlock(&sched_lock);
-    return wake;
+    int wake = cpu_has_ready_peer(cpu);
+    spin_unlock(&cpu->queue_lock);
+    cpu_irq_restore(irqf);
+    if (wake) {
+        return 1;
+    }
+    return any_cpu_has_ready_user_runner();
 }
 
 static void strcpy_local(char *dst, const char *src) {
@@ -594,6 +784,7 @@ void lwkt_cpu_init_idle(void) {
     idle->pending_kill = 0;
     idle->quantum_left = LWKT_QUANTUM_TICKS;
     idle->quantum_force = 0;
+    idle->queue_pinned = 0;
     idle->last_ipc_bump_tick = 0;
     idle->wait_next = NULL;
     idle->mbox_wait_next = NULL;
@@ -605,7 +796,7 @@ void lwkt_cpu_init_idle(void) {
 }
 
 void lwkt_init(void) {
-    spin_init(&sched_lock);
+    spin_init(&thread_pool_lock);
     for (int i = 0; i < MAX_THREADS; i++) {
         thread_pool[i].id = 0;
         thread_pool[i].state = THREAD_TERMINATED;
@@ -676,14 +867,6 @@ void lwkt_sched_stop(void) {
     }
 }
 
-static void sched_lock_irqsave(uint64_t *irqf) {
-    spin_lock_irqsave(&sched_lock, irqf);
-}
-
-static void sched_unlock_irqrestore(uint64_t irqf) {
-    spin_unlock_irqrestore(&sched_lock, irqf);
-}
-
 void lwkt_ipc_bump(struct lwkt_thread *t) {
     ipc_bump_attempts++;
     if (!t || t->state != THREAD_READY) {
@@ -702,13 +885,18 @@ void lwkt_ipc_bump(struct lwkt_thread *t) {
     }
     t->last_ipc_bump_tick = now;
 
-    uint64_t irqf;
-    sched_lock_irqsave(&irqf);
     if (t->state == THREAD_READY) {
         remove_from_queues(t);
-        enqueue_on_cpu_head(pick_enqueue_cpu(NULL), t);
+        struct cpu *dest = pick_enqueue_cpu(NULL);
+        if (!dest) {
+            dest = this_cpu();
+        }
+        uint64_t irqf = cpu_irq_save();
+        queue_lock(dest);
+        enqueue_on_cpu_head(dest, t);
+        queue_unlock(dest);
+        cpu_irq_restore(irqf);
     }
-    sched_unlock_irqrestore(irqf);
     ipc_bump_applied++;
     lwkt_sched_ipi_thread(t);
 }
@@ -766,6 +954,7 @@ static struct lwkt_thread *lwkt_create_locked(const char *name, void (*entry)(vo
     t->pending_kill = 0;
     t->quantum_left = LWKT_QUANTUM_TICKS;
     t->quantum_force = 0;
+    t->queue_pinned = 0;
     t->last_ipc_bump_tick = 0;
     t->wait_next = NULL;
     t->mbox_wait_next = NULL;
@@ -789,7 +978,6 @@ static struct lwkt_thread *lwkt_create_locked(const char *name, void (*entry)(vo
     }
 
     init_thread_stack(t);
-    enqueue_thread(t);
     thread_count++;
     return t;
 }
@@ -800,18 +988,19 @@ struct lwkt_thread *lwkt_create(const char *name, void (*entry)(void *), void *a
     }
 
     uint64_t irqf;
-    sched_lock_irqsave(&irqf);
+    pool_lock_irqsave(&irqf);
     if (thread_count >= MAX_THREADS) {
-        sched_unlock_irqrestore(irqf);
+        pool_unlock_irqrestore(irqf);
         return NULL;
     }
 
     struct lwkt_thread *t = lwkt_create_locked(name, entry, arg, priority, NULL, NULL);
-    sched_unlock_irqrestore(irqf);
+    pool_unlock_irqrestore(irqf);
     if (!t) {
         return NULL;
     }
 
+    enqueue_thread(t);
     lwkt_sched_ipi_thread(t);
     return t;
 }
@@ -824,18 +1013,19 @@ struct lwkt_thread *lwkt_create_user(const char *name, void (*entry)(void *), vo
     }
 
     uint64_t irqf;
-    sched_lock_irqsave(&irqf);
+    pool_lock_irqsave(&irqf);
     if (thread_count >= MAX_THREADS) {
-        sched_unlock_irqrestore(irqf);
+        pool_unlock_irqrestore(irqf);
         return NULL;
     }
 
     struct lwkt_thread *t = lwkt_create_locked(name, entry, arg, priority, user_p, bind_u);
-    sched_unlock_irqrestore(irqf);
+    pool_unlock_irqrestore(irqf);
     if (!t) {
         return NULL;
     }
 
+    enqueue_thread(t);
     lwkt_sched_ipi_thread(t);
     return t;
 }
@@ -847,16 +1037,18 @@ int lwkt_destroy(uint32_t id) {
 
     int wake_blocked = 0;
     int owner_cpu = -1;
+    struct lwkt_thread *t;
+    enum thread_state old;
 
     uint64_t irqf;
-    sched_lock_irqsave(&irqf);
-    struct lwkt_thread *t = find_thread(id);
+    pool_lock_irqsave(&irqf);
+    t = find_thread(id);
     if (!t) {
-        sched_unlock_irqrestore(irqf);
+        pool_unlock_irqrestore(irqf);
         return -1;
     }
 
-    enum thread_state old = t->state;
+    old = t->state;
     owner_cpu = thread_owner_cpu_id(t);
     int self_current = owner_cpu >= 0 &&
                        this_cpu() &&
@@ -865,7 +1057,7 @@ int lwkt_destroy(uint32_t id) {
     if (owner_cpu >= 0 && !self_current) {
         t->pending_kill = 1;
         t->entry_point = NULL;
-        sched_unlock_irqrestore(irqf);
+        pool_unlock_irqrestore(irqf);
         lwkt_sched_ipi_cpu(cpu_by_id((uint32_t)owner_cpu));
         return 0;
     }
@@ -873,12 +1065,14 @@ int lwkt_destroy(uint32_t id) {
     if (self_current) {
         t->pending_kill = 1;
         t->entry_point = NULL;
-        sched_unlock_irqrestore(irqf);
+        pool_unlock_irqrestore(irqf);
         lwkt_thread_exit();
         return 0;
     }
 
     t->entry_point = NULL;
+    pool_unlock_irqrestore(irqf);
+
     remove_from_queues(t);
 
     if (old == THREAD_BLOCKED) {
@@ -889,12 +1083,13 @@ int lwkt_destroy(uint32_t id) {
     } else {
         msgport_clear_slot(t->mbox_slot);
         msgport_unregister_id(t->id);
+        pool_lock_irqsave(&irqf);
         t->state = THREAD_TERMINATED;
         t->rsp = 0;
         t->id = 0;
         thread_count--;
+        pool_unlock_irqrestore(irqf);
     }
-    sched_unlock_irqrestore(irqf);
 
     if (wake_blocked) {
         msgport_wakeup(t);
@@ -962,15 +1157,14 @@ struct lwkt_list_snap {
 static int lwkt_list_collect(struct lwkt_list_snap *snap, int max,
                              struct lwkt_thread *current) {
     int n = 0;
-    uint64_t irqf;
-
-    sched_lock_irqsave(&irqf);
+    uint64_t irqf = cpu_irq_save();
 
     for (uint32_t ci = 0; ci < cpu_online_count() && n < max; ci++) {
         struct cpu *c = cpu_by_id(ci);
         if (!c || !c->online) {
             continue;
         }
+        queue_lock(c);
         for (int p = 0; p < MAX_PRIORITY && n < max; p++) {
             int guard = 0;
             for (struct lwkt_thread *t = c->run_queues[p];
@@ -982,8 +1176,10 @@ static int lwkt_list_collect(struct lwkt_list_snap *snap, int max,
                 snap[n++].t = t;
             }
         }
+        queue_unlock(c);
     }
 
+    spin_lock(&thread_pool_lock);
     for (int i = 0; i < MAX_THREADS && n < max; i++) {
         struct lwkt_thread *t = &thread_pool[i];
         if (t->id == 0 || t == current || t->state != THREAD_BLOCKED) {
@@ -991,8 +1187,8 @@ static int lwkt_list_collect(struct lwkt_list_snap *snap, int max,
         }
         snap[n++].t = t;
     }
-
-    sched_unlock_irqrestore(irqf);
+    spin_unlock(&thread_pool_lock);
+    cpu_irq_restore(irqf);
     return n;
 }
 
@@ -1009,9 +1205,9 @@ void lwkt_list(void) {
 
     snap_n = lwkt_list_collect(snap, LWKT_LIST_SNAP_MAX, current);
 
-    sched_lock_irqsave(&irqf);
+    pool_lock_irqsave(&irqf);
     total = thread_count;
-    sched_unlock_irqrestore(irqf);
+    pool_unlock_irqrestore(irqf);
 
     if (current) {
         print_thread_row(current, 1);
@@ -1056,19 +1252,19 @@ void lwkt_smp_balance(void) {
         char tname[16];
     } snap[MAX_CPUS];
     uint32_t n = 0;
-    uint64_t irqf;
 
     console_writestring("\nSMP balance (KSE user uthreads per LWKT):\n");
     console_writestring("CPU  Switches  Steals  Pulls  Current          Runners(run/rdy)  LWKT-ready\n");
     console_writestring("---  ---------  ------  -----  ---------------  ----------------  ----------\n");
 
-    sched_lock_irqsave(&irqf);
+    uint64_t irqf = cpu_irq_save();
     for (uint32_t i = 0; i < cpu_online_count() && n < MAX_CPUS; i++) {
         struct cpu *c = cpu_by_id(i);
         if (!c || !c->online) {
             continue;
         }
 
+        queue_lock(c);
         snap[n].id = c->id;
         snap[n].switches = c->switches;
         snap[n].steals = c->steals;
@@ -1099,9 +1295,10 @@ void lwkt_smp_balance(void) {
                 }
             }
         }
+        queue_unlock(c);
         n++;
     }
-    sched_unlock_irqrestore(irqf);
+    cpu_irq_restore(irqf);
 
     for (uint32_t i = 0; i < n; i++) {
         write_u64_padded((uint64_t)snap[i].id, 3);
@@ -1140,31 +1337,6 @@ struct lwkt_thread *lwkt_curthread(void) {
 int lwkt_in_usersyscall(void) {
     struct lwkt_thread *cur = lwkt_curthread();
     return cur && cur->in_syscall;
-}
-
-static int sched_has_ready_other(struct lwkt_thread *skip) {
-    uint64_t irqf;
-    sched_lock_irqsave(&irqf);
-    for (uint32_t i = 0; i < cpu_online_count(); i++) {
-        struct cpu *c = cpu_by_id(i);
-        if (!c || !c->online) {
-            continue;
-        }
-        for (uint32_t p = 0; p < MAX_PRIORITY; p++) {
-            int guard = 0;
-            for (struct lwkt_thread *t = c->run_queues[p];
-                 t && guard < MAX_THREADS;
-                 t = t->next, guard++) {
-                if (t == skip || t == &c->idle || t->state != THREAD_READY) {
-                    continue;
-                }
-                sched_unlock_irqrestore(irqf);
-                return 1;
-            }
-        }
-    }
-    sched_unlock_irqrestore(irqf);
-    return 0;
 }
 
 void lwkt_syscall_wait_edge(void) {
@@ -1216,9 +1388,8 @@ static void lwkt_apply_tss(struct lwkt_thread *t) {
 
 void lwkt_bootstrap_first(void) {
     struct cpu *cpu = this_cpu();
-    uint64_t irqf;
+    uint64_t irqf = cpu_irq_save();
 
-    sched_lock_irqsave(&irqf);
     struct lwkt_thread *next = dequeue_thread(cpu, NULL);
     if (!next) {
         next = &cpu->idle;
@@ -1227,7 +1398,7 @@ void lwkt_bootstrap_first(void) {
     cpu->idle.state = THREAD_READY;
     cpu->current = next;
     next->state = THREAD_RUNNING;
-    sched_unlock_irqrestore(irqf);
+    cpu_irq_restore(irqf);
 
     /* Shell is RUNNING on BSP (not in queue); safe to wake AP schedulers. */
     smp_start_aps();
@@ -1323,16 +1494,10 @@ void lwkt_preempt_check(void) {
     }
 
     int other = 0;
-    if (!spin_trylock(&sched_lock)) {
-        return;
-    }
-    for (uint32_t ci = 0; ci < cpu_online_count(); ci++) {
-        struct cpu *c = cpu_by_id(ci);
-        if (!c || !c->online) {
-            continue;
-        }
+    uint64_t irqf = cpu_irq_save();
+    if (spin_trylock(&cpu->queue_lock)) {
         for (uint32_t p = 0; p < MAX_PRIORITY; p++) {
-            for (struct lwkt_thread *t = c->run_queues[p]; t; t = t->next) {
+            for (struct lwkt_thread *t = cpu->run_queues[p]; t; t = t->next) {
                 if (t != cur && t->state == THREAD_READY) {
                     other = 1;
                     break;
@@ -1342,11 +1507,39 @@ void lwkt_preempt_check(void) {
                 break;
             }
         }
-        if (other) {
-            break;
+        spin_unlock(&cpu->queue_lock);
+    } else {
+        /* Contended local queue — assume work may exist. */
+        other = 1;
+    }
+    if (!other) {
+        for (uint32_t ci = 0; ci < cpu_online_count(); ci++) {
+            struct cpu *c = cpu_by_id(ci);
+            if (!c || !c->online || c == cpu) {
+                continue;
+            }
+            if (!spin_trylock(&c->queue_lock)) {
+                other = 1;
+                break;
+            }
+            for (uint32_t p = 0; p < MAX_PRIORITY; p++) {
+                for (struct lwkt_thread *t = c->run_queues[p]; t; t = t->next) {
+                    if (t->state == THREAD_READY) {
+                        other = 1;
+                        break;
+                    }
+                }
+                if (other) {
+                    break;
+                }
+            }
+            spin_unlock(&c->queue_lock);
+            if (other) {
+                break;
+            }
         }
     }
-    spin_unlock(&sched_lock);
+    cpu_irq_restore(irqf);
 
     if (!other && cur == &cpu->idle) {
         cpu->preempt_requested = 0;
@@ -1375,17 +1568,25 @@ void lwkt_switch(void) {
         return;
     }
 
-    spin_lock(&sched_lock);
+    /*
+     * Enqueue before dequeue (baseline). queue_pinned keeps the yielder
+     * unstealable until this (or another local) dequeue selects it — otherwise
+     * a remote CPU can run it while switch_context still uses its stack.
+     */
     if (prev && prev->state == THREAD_RUNNING) {
         prev->state = THREAD_READY;
         prev->yields++;
-        enqueue_thread(prev);
+        prev->queue_pinned = 1;
+        queue_lock(cpu);
+        enqueue_on_cpu(cpu, prev);
+        queue_unlock(cpu);
     }
 
     struct lwkt_thread *next = dequeue_thread(cpu, prev);
+    next->queue_pinned = 0;
+
     if (next == prev) {
         next->state = THREAD_RUNNING;
-        spin_unlock(&sched_lock);
         cpu_irq_restore(irqf);
         return;
     }
@@ -1396,7 +1597,6 @@ void lwkt_switch(void) {
 
     next->state = THREAD_RUNNING;
     cpu->current = next;
-    spin_unlock(&sched_lock);
 
     if (next->rsp == 0) {
         next = &cpu->idle;
@@ -1480,13 +1680,8 @@ void lwkt_unblock(struct lwkt_thread *t) {
     if (!t || t->state != THREAD_BLOCKED) {
         return;
     }
-    uint64_t irqf;
-    struct cpu *dest;
-    sched_lock_irqsave(&irqf);
     t->state = THREAD_READY;
-    enqueue_thread(t);
-    dest = cpu_by_id(t->run_cpu);
-    sched_unlock_irqrestore(irqf);
+    struct cpu *dest = enqueue_thread(t);
     lwkt_sched_ipi_cpu(dest);
 }
 
@@ -1495,44 +1690,48 @@ void lwkt_nudge(struct lwkt_thread *t) {
         return;
     }
 
-    uint64_t irqf;
     struct cpu *dest = NULL;
-    sched_lock_irqsave(&irqf);
     if (t->state == THREAD_BLOCKED) {
         t->state = THREAD_READY;
-        enqueue_thread(t);
-        dest = cpu_by_id(t->run_cpu);
+        dest = enqueue_thread(t);
     } else if (t->state == THREAD_READY) {
-        remove_from_queues(t);
-        dest = cpu_by_id(t->run_cpu);
-        if (!dest || !dest->online) {
-            dest = this_cpu();
-        }
-        if (dest) {
-            enqueue_on_cpu_head(dest, t);
+        if (!remove_from_queues(t)) {
+            /* Stolen/claimed between check and remove — IPI owner only. */
+            dest = cpu_for_thread_wake(t);
+        } else {
+            dest = cpu_by_id(t->run_cpu);
+            if (!dest || !dest->online) {
+                dest = this_cpu();
+            }
+            if (dest) {
+                uint64_t irqf = cpu_irq_save();
+                queue_lock(dest);
+                enqueue_on_cpu_head(dest, t);
+                queue_unlock(dest);
+                cpu_irq_restore(irqf);
+            }
         }
     } else {
         dest = cpu_for_thread_wake(t);
     }
-    sched_unlock_irqrestore(irqf);
     lwkt_sched_ipi_cpu(dest);
 }
 
 void lwkt_thread_exit(void) {
     struct cpu *cpu = this_cpu();
     if (cpu && cpu->current) {
-        uint64_t irqf;
-        sched_lock_irqsave(&irqf);
         remove_from_queues(cpu->current);
-        sched_unlock_irqrestore(irqf);
         msgport_clear_slot(cpu->current->mbox_slot);
         msgport_unregister_id(cpu->current->id);
         cpu->current->state = THREAD_TERMINATED;
         cpu->current->entry_point = NULL;
         cpu->current->pending_kill = 0;
         cpu->current->in_syscall = 0;
+        uint64_t irqf;
+        pool_lock_irqsave(&irqf);
         cpu->current->id = 0;
         thread_count--;
+        pool_unlock_irqrestore(irqf);
     }
     lwkt_yield();
     for (;;) {

@@ -19,6 +19,7 @@ struct cpu {
     struct lwkt_thread *current;
     struct lwkt_thread idle;
     struct lwkt_thread *run_queues[MAX_PRIORITY];
+    spinlock_t queue_lock;
     volatile int preempt_requested;
     int sched_active;
     uint64_t bootstrap_rsp;

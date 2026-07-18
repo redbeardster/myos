@@ -65,6 +65,7 @@ struct lwkt_thread {
     uint8_t pending_kill;
     uint8_t quantum_left;
     uint8_t quantum_force;
+    uint8_t queue_pinned; /* set while yielding; foreign steal must skip until dequeued */
     uint8_t mbox_slot;
     uint32_t last_ipc_bump_tick;
     struct lwkt_thread *wait_next;      /* token / proc_mutex wait queues */

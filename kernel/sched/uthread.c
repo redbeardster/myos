@@ -1001,6 +1001,14 @@ int uthread_join(uint32_t uthread_id, int *exit_code_out) {
                 self->state = UTHREAD_BLOCKED;
             }
         }
+        /* Close lost-wakeup: exit may land between the first take and waiter install. */
+        if (join_take_and_reap(uthread_id, exit_code_out)) {
+            if (self && u) {
+                u->join_waiter = NULL;
+            }
+            spin_unlock_irqrestore(&uthread_join_lock, irqf);
+            return 0;
+        }
         spin_unlock_irqrestore(&uthread_join_lock, irqf);
 
         proc_sched_nudge(p);

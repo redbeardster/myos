@@ -98,6 +98,7 @@ static struct cpu *cpu_alloc(uint32_t lapic_id, int bsp) {
     c->steals = 0;
     c->same_proc_pulls = 0;
     c->ipi_rx = 0;
+    spin_init(&c->queue_lock);
     for (int i = 0; i < MAX_PRIORITY; i++) {
         c->run_queues[i] = NULL;
     }
