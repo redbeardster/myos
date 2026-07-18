@@ -216,7 +216,9 @@ expect tools/qemu_runner_7b_test.exp build/myos.iso 1 2 4 8 16
 expect tools/qemu_kse_test.exp
 ```
 
-**Критерий done:** `ping` / `msg` / `exec threads.elf` (×2) / `threads` / `uthreads` / `cpus` на SMP=1..8 (и 16 после поднятия `MAX_CPUS`); KSE-регрессия зелёная.
+**Критерий done:** `ping` / `msg` / `exec threads.elf` (×2) / `threads` / `uthreads` / `cpus` на SMP=1..8 и 16 (`MAX_CPUS=16`); KSE-регрессия зелёная.
+
+**Позже:** поднять `MAX_CPUS` и прогнать матрицу на >16 CPU (сейчас лишние AP Limine паркуются в hlt).
 
 ---
 
